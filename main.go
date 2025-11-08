@@ -57,18 +57,22 @@ Examples:
 `)
 }
 
-// Hash utilities
+// Hash utilities.
 func pathHash(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
 }
 
 func fileHash(path string) (string, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- path comes from user input, which is expected
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -82,13 +86,13 @@ func openDB(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	// Ensure schema
-	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-		db.Close()
-		return nil, err
+	if _, execErr := db.Exec("PRAGMA journal_mode=WAL;"); execErr != nil {
+		_ = db.Close()
+		return nil, execErr
 	}
 	schema, err := os.ReadFile(".quality/schema.sql")
 	if err == nil {
-		db.Exec(string(schema))
+		_, _ = db.Exec(string(schema))
 	}
 	return db, nil
 }
@@ -97,14 +101,14 @@ func enqueueCmd() {
 	fs := flag.NewFlagSet("enqueue", flag.ExitOnError)
 	treatment := fs.String("treatment", "default", "treatment name")
 	dbPath := fs.String("db", defaultDB, "database path")
-	fs.Parse(os.Args[2:])
+	_ = fs.Parse(os.Args[2:])
 
 	db, err := openDB(*dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	scanner := bufio.NewScanner(os.Stdin)
 	count := 0
@@ -141,14 +145,14 @@ func claimCmd() {
 	cursor := fs.String("cursor", "", "resume after this path_hash")
 	n := fs.Int("n", 1, "number to claim")
 	dbPath := fs.String("db", defaultDB, "database path")
-	fs.Parse(os.Args[2:])
+	_ = fs.Parse(os.Args[2:])
 
 	db, err := openDB(*dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	rows, err := db.Query(`
 		SELECT path, path_hash FROM queue
@@ -158,9 +162,9 @@ func claimCmd() {
 	`, *treatment, *cursor, *n)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "query error: %v\n", err)
-		os.Exit(1)
+		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var path, hash string
@@ -168,6 +172,10 @@ func claimCmd() {
 			continue
 		}
 		fmt.Println(path)
+	}
+
+	if err := rows.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "rows error: %v\n", err)
 	}
 }
 
@@ -178,7 +186,7 @@ func doneCmd() {
 	revisit := fs.String("revisit", "", "revisit after duration (e.g., '14 days')")
 	treatment := fs.String("treatment", "default", "treatment name")
 	dbPath := fs.String("db", defaultDB, "database path")
-	fs.Parse(os.Args[2:])
+	_ = fs.Parse(os.Args[2:])
 
 	if *path == "" {
 		fmt.Fprintf(os.Stderr, "error: --path required\n")
@@ -196,7 +204,7 @@ func doneCmd() {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	var nextAt *string
@@ -212,7 +220,6 @@ func doneCmd() {
 	`, now, *result, nextAt, absPath, *treatment)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "update error: %v\n", err)
-		os.Exit(1)
 	}
 }
 
@@ -220,14 +227,14 @@ func statusCmd() {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	treatment := fs.String("treatment", "", "filter by treatment (empty = all)")
 	dbPath := fs.String("db", defaultDB, "database path")
-	fs.Parse(os.Args[2:])
+	_ = fs.Parse(os.Args[2:])
 
 	db, err := openDB(*dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	query := `
 		SELECT treatment, 
@@ -245,16 +252,22 @@ func statusCmd() {
 	rows, err := db.Query(query, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "query error: %v\n", err)
-		os.Exit(1)
+		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	fmt.Printf("%-20s %10s %10s\n", "TREATMENT", "PENDING", "DONE")
 	for rows.Next() {
 		var t string
 		var pending, done int
-		rows.Scan(&t, &pending, &done)
+		if err := rows.Scan(&t, &pending, &done); err != nil {
+			continue
+		}
 		fmt.Printf("%-20s %10d %10d\n", t, pending, done)
+	}
+
+	if err := rows.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "rows error: %v\n", err)
 	}
 }
 
@@ -263,7 +276,7 @@ func resetCmd() {
 	treatment := fs.String("treatment", "", "treatment to reset (required)")
 	dbPath := fs.String("db", defaultDB, "database path")
 	confirm := fs.Bool("yes", false, "skip confirmation")
-	fs.Parse(os.Args[2:])
+	_ = fs.Parse(os.Args[2:])
 
 	if *treatment == "" {
 		fmt.Fprintf(os.Stderr, "error: --treatment required\n")
@@ -273,9 +286,9 @@ func resetCmd() {
 	if !*confirm {
 		fmt.Printf("Delete all entries for treatment=%s? [y/N] ", *treatment)
 		var response string
-		fmt.Scanln(&response)
+		_, _ = fmt.Scanln(&response)
 		if response != "y" && response != "Y" {
-			fmt.Println("cancelled")
+			fmt.Println("canceled")
 			return
 		}
 	}
@@ -285,12 +298,12 @@ func resetCmd() {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	res, err := db.Exec("DELETE FROM queue WHERE treatment=?", *treatment)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "delete error: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	n, _ := res.RowsAffected()
 	fmt.Printf("deleted %d entries\n", n)
