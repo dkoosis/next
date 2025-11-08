@@ -441,7 +441,7 @@ func TestResetCmd_DeletesEntries_When_Confirmed(t *testing.T) {
 		t.Fatalf("unexpected output: %q", output)
 	}
 
-	dbVerify, err := sql.Open("sqlite", dbPath)
+	dbVerify, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		t.Fatalf("open verify db: %v", err)
 	}
@@ -500,7 +500,7 @@ func TestDoneCmd_MarksEntryDone_When_PathProvided(t *testing.T) {
 
 	doneCmd()
 
-	verifyDB, err := sql.Open("sqlite", dbPath)
+	verifyDB, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		t.Fatalf("open verify db: %v", err)
 	}
