@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-func setupWorkDir(t *testing.T, withSchema bool) (string, func()) {
+func setupWorkDir(t *testing.T, withSchema bool) (dir string, cleanup func()) {
 	t.Helper()
 	oldWD, err := os.Getwd()
 	if err != nil {
@@ -121,13 +121,13 @@ func TestOpenDB_CreatesSchema_When_SchemaPresent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	var journalMode string
 	if err := db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
 		t.Fatalf("query journal_mode: %v", err)
 	}
-	if strings.ToLower(journalMode) != "wal" {
+	if !strings.EqualFold(journalMode, "wal") {
 		t.Fatalf("journal mode = %s, want wal", journalMode)
 	}
 
@@ -148,7 +148,7 @@ func TestOpenDB_ReturnsDB_When_SchemaMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Ping(); err != nil {
 		t.Fatalf("ping: %v", err)
@@ -174,14 +174,14 @@ func TestEnqueueCmd_InsertsRows_When_InputContainsValidPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create temp input: %v", err)
 	}
-	defer inputFile.Close()
+	defer func() { _ = inputFile.Close() }()
 
-	fmt.Fprintln(inputFile, "")
-	fmt.Fprintln(inputFile, filepath.Join(tmpDir, "missing.txt"))
-	fmt.Fprintln(inputFile, validAbs)
-	fmt.Fprintln(inputFile, validAbs)
-	if _, err := inputFile.Seek(0, 0); err != nil {
-		t.Fatalf("seek: %v", err)
+	_, _ = fmt.Fprintln(inputFile, "")
+	_, _ = fmt.Fprintln(inputFile, filepath.Join(tmpDir, "missing.txt"))
+	_, _ = fmt.Fprintln(inputFile, validAbs)
+	_, _ = fmt.Fprintln(inputFile, validAbs)
+	if _, seekErr := inputFile.Seek(0, 0); seekErr != nil {
+		t.Fatalf("seek: %v", seekErr)
 	}
 
 	oldArgs := os.Args
@@ -206,12 +206,12 @@ func TestEnqueueCmd_InsertsRows_When_InputContainsValidPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openDB verify: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	row := db.QueryRow("SELECT path, content_hash FROM queue WHERE treatment=?", "lint")
 	var storedPath, storedHash string
-	if err := row.Scan(&storedPath, &storedHash); err != nil {
-		t.Fatalf("scan: %v", err)
+	if scanErr := row.Scan(&storedPath, &storedHash); scanErr != nil {
+		t.Fatalf("scan: %v", scanErr)
 	}
 	if storedPath != validAbs {
 		t.Fatalf("stored path = %s, want %s", storedPath, validAbs)
@@ -404,29 +404,29 @@ func TestResetCmd_DeletesEntries_When_Confirmed(t *testing.T) {
 	}
 
 	lintPath := filepath.Join(tmpDir, "lint.txt")
-	if err := os.WriteFile(lintPath, []byte("lint"), 0o600); err != nil {
-		t.Fatalf("write lint: %v", err)
+	if writeErr := os.WriteFile(lintPath, []byte("lint"), 0o600); writeErr != nil {
+		t.Fatalf("write lint: %v", writeErr)
 	}
-	if _, err := db.Exec(`
+	if _, execErr := db.Exec(`
         INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
         VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-    `, lintPath, pathHash(lintPath), "hash-lint", "lint"); err != nil {
-		t.Fatalf("insert lint: %v", err)
+    `, lintPath, pathHash(lintPath), "hash-lint", "lint"); execErr != nil {
+		t.Fatalf("insert lint: %v", execErr)
 	}
 
 	otherPath := filepath.Join(tmpDir, "other.txt")
-	if err := os.WriteFile(otherPath, []byte("other"), 0o600); err != nil {
-		t.Fatalf("write other: %v", err)
+	if writeErr2 := os.WriteFile(otherPath, []byte("other"), 0o600); writeErr2 != nil {
+		t.Fatalf("write other: %v", writeErr2)
 	}
-	if _, err := db.Exec(`
+	if _, execErr2 := db.Exec(`
         INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
         VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-    `, otherPath, pathHash(otherPath), "hash-other", "other"); err != nil {
-		t.Fatalf("insert other: %v", err)
+    `, otherPath, pathHash(otherPath), "hash-other", "other"); execErr2 != nil {
+		t.Fatalf("insert other: %v", execErr2)
 	}
 
-	if err := db.Close(); err != nil {
-		t.Fatalf("close db: %v", err)
+	if closeErr := db.Close(); closeErr != nil {
+		t.Fatalf("close db: %v", closeErr)
 	}
 
 	oldArgs := os.Args
@@ -445,7 +445,7 @@ func TestResetCmd_DeletesEntries_When_Confirmed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open verify db: %v", err)
 	}
-	defer dbVerify.Close()
+	defer func() { _ = dbVerify.Close() }()
 
 	var lintCount int
 	if err := dbVerify.QueryRow("SELECT COUNT(*) FROM queue WHERE treatment=?", "lint").Scan(&lintCount); err != nil {
@@ -475,23 +475,23 @@ func TestDoneCmd_MarksEntryDone_When_PathProvided(t *testing.T) {
 	}
 
 	targetPath := filepath.Join(tmpDir, "target.txt")
-	if err := os.WriteFile(targetPath, []byte("target"), 0o600); err != nil {
-		t.Fatalf("write target: %v", err)
+	if writeErr := os.WriteFile(targetPath, []byte("target"), 0o600); writeErr != nil {
+		t.Fatalf("write target: %v", writeErr)
 	}
-	absTarget, err := filepath.Abs(targetPath)
-	if err != nil {
-		t.Fatalf("abs target: %v", err)
+	absTarget, absErr := filepath.Abs(targetPath)
+	if absErr != nil {
+		t.Fatalf("abs target: %v", absErr)
 	}
 
-	if _, err := db.Exec(`
+	if _, execErr := db.Exec(`
         INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
         VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-    `, absTarget, pathHash(absTarget), "hash-target", "lint"); err != nil {
-		t.Fatalf("insert target: %v", err)
+    `, absTarget, pathHash(absTarget), "hash-target", "lint"); execErr != nil {
+		t.Fatalf("insert target: %v", execErr)
 	}
 
-	if err := db.Close(); err != nil {
-		t.Fatalf("close db: %v", err)
+	if closeErr := db.Close(); closeErr != nil {
+		t.Fatalf("close db: %v", closeErr)
 	}
 
 	oldArgs := os.Args
@@ -504,7 +504,7 @@ func TestDoneCmd_MarksEntryDone_When_PathProvided(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open verify db: %v", err)
 	}
-	defer verifyDB.Close()
+	defer func() { _ = verifyDB.Close() }()
 
 	row := verifyDB.QueryRow("SELECT done_at, result, next_at FROM queue WHERE path=?", absTarget)
 	var doneAt, result, nextAt sql.NullString
