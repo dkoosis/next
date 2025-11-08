@@ -1,0 +1,127 @@
+# golangci-lint configuration for next
+# https://golangci-lint.run/usage/configuration/
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    # Enabled by default (keeping them explicit)
+    - errcheck      # Checks for unchecked errors
+    - govet         # Reports suspicious constructs
+    - ineffassign   # Detects unused assignments
+    - staticcheck   # Go static analysis (includes gosimple)
+    - unused        # Checks for unused code
+
+    # Correctness & Bug Detection (HIGH VALUE)
+    - bodyclose     # Checks HTTP response body is closed
+    - contextcheck  # Checks context usage
+    - errorlint     # Find code that will cause problems with Go 1.13+ error wrapping
+    - nilerr        # Finds code that returns nil even if it checks that error is not nil
+    - nilnil        # Checks that there is no simultaneous return of nil error and invalid value
+    - noctx         # Finds sending HTTP request without context.Context
+    - rowserrcheck  # Checks whether Rows.Err is checked
+    - sqlclosecheck # Checks that sql.Rows and sql.Stmt are closed
+
+    # Code Quality (HIGH VALUE)
+    - gocyclo       # Cyclomatic complexity
+    - gocognit      # Cognitive complexity
+    - funlen        # Long functions
+    - goconst       # Repeated strings that could be constants
+    - gocritic      # Meta-linter with lots of useful checks
+    - nestif        # Reports deeply nested if statements
+    - dupl          # Code clone detection
+
+    # Performance
+    - prealloc      # Find slice declarations that could pre-allocate
+    - unconvert     # Remove unnecessary type conversions
+
+    # Style & Maintainability
+    - misspell      # Spell checking
+    - whitespace    # Whitespace issues
+    - godot         # Check comments end with period
+    - unparam       # Unused function parameters
+    - predeclared   # Find code that shadows predeclared identifiers
+
+    # Documentation
+    - godox         # Detect FIXME, TODO, etc.
+
+    # Security
+    - gosec         # Security problems
+
+  exclusions:
+    rules:
+      # Exclude funlen, gocyclo, gocognit from test files
+      - path: '(.+)_test\.go'
+        linters:
+          - funlen
+          - gocyclo
+          - gocognit
+          - dupl
+          - gosec
+
+  settings:
+    errcheck:
+      # Don't require checking errors from these functions
+      exclude-functions:
+        - (io.Closer).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.Stmt).Close
+
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment  # Struct field alignment is overly strict
+
+    gocyclo:
+      min-complexity: 15  # Default is 30, we want stricter
+
+    gocognit:
+      min-complexity: 30  # Cognitive complexity threshold
+
+    funlen:
+      lines: 120          # Max function length in lines
+      statements: 70      # Max statements in function
+      ignore-comments: true  # Ignore comment lines when counting
+
+    goconst:
+      min-len: 3          # Minimum string length
+      min-occurrences: 3  # Minimum occurrences to trigger
+
+    nestif:
+      min-complexity: 5   # Minimum nesting complexity to report
+
+    dupl:
+      threshold: 150      # Tokens threshold for duplicate code
+
+    misspell:
+      locale: US
+
+    godot:
+      scope: declarations # Only check comments for top-level declarations
+      capital: false      # Don't require sentences to start with capital
+
+    godox:
+      keywords:
+        - FIXME
+        - BUG
+        - HACK
+
+    gosec:
+      excludes:
+        - G104  # Unhandled errors (already covered by errcheck)
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+        - experimental
+        - opinionated
+      disabled-checks:
+        - whyNoLint    # Don't require explanation for nolint
+        - hugeParam    # Too noisy for our use case
