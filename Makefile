@@ -1,7 +1,12 @@
-.PHONY: build test install clean
+.PHONY: build test install clean lint
 
-build:
+build: lint
 	go build -o next .
+
+lint:
+	@echo "Running golangci-lint..."
+	@which golangci-lint > /dev/null || (echo "golangci-lint not installed. Install with: brew install golangci-lint" && exit 1)
+	golangci-lint run --config .golangci.yml
 
 install: build
 	cp next ~/bin/next
