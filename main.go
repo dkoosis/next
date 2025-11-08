@@ -16,7 +16,7 @@ import (
 	_ "github.com/ncruces/go-sqlite3/embed"
 )
 
-const defaultDB = ".quality/ledger.db"
+const defaultDBPath = ".quality/ledger.db"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -93,21 +93,30 @@ func openDB(path string) (*sql.DB, error) {
 	}
 	schema, err := os.ReadFile(".quality/schema.sql")
 	if err == nil {
-		_, _ = db.Exec(string(schema))
+		if _, execErr := db.Exec(string(schema)); execErr != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("schema execution failed: %w", execErr)
+		}
 	}
 	return db, nil
 }
 
 func enqueueCmd() {
+	if err := doEnqueueCmd(); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+}
+
+func doEnqueueCmd() error {
 	fs := flag.NewFlagSet("enqueue", flag.ExitOnError)
 	treatment := fs.String("treatment", "default", "treatment name")
-	dbPath := fs.String("db", defaultDB, "database path")
+	dbPath := fs.String("db", defaultDBPath, "database path")
 	_ = fs.Parse(os.Args[2:])
 
 	db, err := openDB(*dbPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("db error: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 
@@ -121,23 +130,32 @@ func enqueueCmd() {
 		// Make path absolute for consistency
 		absPath, err := filepath.Abs(path)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping %q: %v\n", path, err)
 			continue
 		}
 		ph := pathHash(absPath)
 		ch, err := fileHash(absPath)
 		if err != nil {
-			continue // skip unreadable files
+			fmt.Fprintf(os.Stderr, "warning: skipping %q: %v\n", absPath, err)
+			continue
 		}
 		_, err = db.Exec(`
-			INSERT OR IGNORE INTO queue 
+			INSERT OR IGNORE INTO queue
 			(path, path_hash, content_hash, treatment, done_at, result, next_at)
 			VALUES (?, ?, ?, ?, NULL, NULL, NULL)
 		`, absPath, ph, ch, *treatment)
-		if err == nil {
-			count++
+		if err != nil {
+			return fmt.Errorf("error: failed to insert %q: %w", absPath, err)
 		}
+		count++
 	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading stdin: %w", err)
+	}
+
 	fmt.Printf("enqueued %d paths for treatment=%s\n", count, *treatment)
+	return nil
 }
 
 func claimCmd() {
@@ -145,7 +163,7 @@ func claimCmd() {
 	treatment := fs.String("treatment", "default", "treatment name")
 	cursor := fs.String("cursor", "", "resume after this path_hash")
 	n := fs.Int("n", 1, "number to claim")
-	dbPath := fs.String("db", defaultDB, "database path")
+	dbPath := fs.String("db", defaultDBPath, "database path")
 	_ = fs.Parse(os.Args[2:])
 
 	db, err := openDB(*dbPath)
@@ -186,7 +204,7 @@ func doneCmd() {
 	result := fs.String("result", "", "result hash")
 	revisit := fs.String("revisit", "", "revisit after duration (e.g., '14 days')")
 	treatment := fs.String("treatment", "default", "treatment name")
-	dbPath := fs.String("db", defaultDB, "database path")
+	dbPath := fs.String("db", defaultDBPath, "database path")
 	_ = fs.Parse(os.Args[2:])
 
 	if *path == "" {
@@ -227,7 +245,7 @@ func doneCmd() {
 func statusCmd() {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	treatment := fs.String("treatment", "", "filter by treatment (empty = all)")
-	dbPath := fs.String("db", defaultDB, "database path")
+	dbPath := fs.String("db", defaultDBPath, "database path")
 	_ = fs.Parse(os.Args[2:])
 
 	db, err := openDB(*dbPath)
@@ -275,7 +293,7 @@ func statusCmd() {
 func resetCmd() {
 	fs := flag.NewFlagSet("reset", flag.ExitOnError)
 	treatment := fs.String("treatment", "", "treatment to reset (required)")
-	dbPath := fs.String("db", defaultDB, "database path")
+	dbPath := fs.String("db", defaultDBPath, "database path")
 	confirm := fs.Bool("yes", false, "skip confirmation")
 	_ = fs.Parse(os.Args[2:])
 
