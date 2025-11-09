@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"database/sql"
+	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +18,24 @@ import (
 	_ "github.com/ncruces/go-sqlite3/embed"
 )
 
+//go:embed schema.sql
+var embeddedSchemaFS embed.FS
+
+const fallbackSchema = `
+CREATE TABLE IF NOT EXISTS queue (
+  path          TEXT NOT NULL,
+  path_hash     TEXT NOT NULL,
+  content_hash  TEXT NOT NULL,
+  treatment     TEXT NOT NULL,
+  done_at       TEXT,
+  result        TEXT,
+  next_at       TEXT,
+  PRIMARY KEY (path_hash, treatment)
+);
+CREATE INDEX IF NOT EXISTS idx_queue_treatment_done ON queue(treatment, done_at);
+CREATE INDEX IF NOT EXISTS idx_queue_next_at ON queue(next_at);
+`
+
 const defaultDBPath = ".quality/ledger.db"
 
 func main() {
@@ -23,7 +43,6 @@ func main() {
 		usage()
 		os.Exit(1)
 	}
-
 	switch os.Args[1] {
 	case "enqueue":
 		enqueueCmd()
@@ -45,35 +64,71 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `next: deterministic job queue
 
 Commands:
-  enqueue   Read paths from stdin, add to queue
-  claim     Claim next unclaimed path(s)
-  done      Mark path as complete
-  status    Show queue stats
-  reset     Clear treatment from queue
+  enqueue     Read paths from stdin, add to queue
+  claim       Claim next unclaimed path(s)
+  done        Mark path as complete
+  status      Show queue stats
+  reset       Clear treatment from queue
 
 Examples:
   find . -name '*.go' | next enqueue --treatment=lint
-  next claim --treatment=lint
-  next done --path=foo.go --result=abc123
+  next claim --treatment=lint --json
+  next claim --treatment=lint --shard=0 --total-shards=4 --n=100
+  next done --path=foo.go --result=abc123 --revisit='+14 days'
+  next status --json
+
+Parallel processing with sharding:
+  # Worker 1
+  while true; do
+    next claim --treatment=lint --shard=0 --total-shards=4 | xargs -I{} sh -c 'process {}'
+  done
+
+  # Worker 2
+  while true; do
+    next claim --treatment=lint --shard=1 --total-shards=4 | xargs -I{} sh -c 'process {}'
+  done
 `)
 }
 
-// Hash utilities.
+// ----------------------------------------
+// Hash utilities
+// ----------------------------------------
+
 func pathHash(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
 }
 
+// calculateShardRange returns the hash range [start, end) for the given shard.
+// SHA256 hashes are 64 hex chars (256 bits). We divide the space evenly.
+func calculateShardRange(shard, totalShards int) (string, string) {
+	// Use the first 16 hex chars (64 bits) for simplicity
+	const hexDigits = 16
+	const maxVal = uint64(0xFFFFFFFFFFFFFFFF)
+
+	shardSize := maxVal / uint64(totalShards)
+	start := uint64(shard) * shardSize
+	var end uint64
+	if shard == totalShards-1 {
+		// Last shard goes to the end
+		end = maxVal
+	} else {
+		end = start + shardSize
+	}
+
+	// Convert to hex strings, padded to 16 chars, fill rest with zeros
+	startHex := fmt.Sprintf("%016x%048s", start, "")
+	endHex := fmt.Sprintf("%016x%048s", end, "")
+
+	return startHex, endHex
+}
+
 func fileHash(path string) (string, error) {
-	f, err := os.Open(path) // #nosec G304 -- path comes from user input, which is expected
+	f, err := os.Open(path) // #nosec G304 — path is user-provided by design
 	if err != nil {
 		return "", err
 	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil && err == nil {
-			err = closeErr
-		}
-	}()
+	defer f.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -81,25 +136,44 @@ func fileHash(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// ----------------------------------------
+// DB
+// ----------------------------------------
+
 func openDB(path string) (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, err
 	}
-	// Ensure schema
-	if _, execErr := db.Exec("PRAGMA journal_mode=WAL;"); execErr != nil {
+
+	schema := readEmbeddedSchemaOrFallback()
+	if _, execErr := db.Exec(schema); execErr != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("schema execution failed: %w", execErr)
+	}
+
+	if _, execErr := db.Exec(`PRAGMA journal_mode=WAL;`); execErr != nil {
 		_ = db.Close()
 		return nil, execErr
 	}
-	schema, err := os.ReadFile(".quality/schema.sql")
-	if err == nil {
-		if _, execErr := db.Exec(string(schema)); execErr != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("schema execution failed: %w", execErr)
-		}
-	}
+	_, _ = db.Exec(`PRAGMA busy_timeout=3000;`)
+	_, _ = db.Exec(`PRAGMA foreign_keys=ON;`)
 	return db, nil
 }
+
+func readEmbeddedSchemaOrFallback() string {
+	if b, err := embeddedSchemaFS.ReadFile("schema.sql"); err == nil && len(b) > 0 {
+		return string(b)
+	}
+	return fallbackSchema
+}
+
+// ----------------------------------------
+// enqueue
+// ----------------------------------------
 
 func enqueueCmd() {
 	if err := doEnqueueCmd(); err != nil {
@@ -118,7 +192,7 @@ func doEnqueueCmd() error {
 	if err != nil {
 		return fmt.Errorf("db error: %w", err)
 	}
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 
 	scanner := bufio.NewScanner(os.Stdin)
 	count := 0
@@ -127,7 +201,6 @@ func doEnqueueCmd() error {
 		if path == "" {
 			continue
 		}
-		// Make path absolute for consistency
 		absPath, err := filepath.Abs(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: skipping %q: %v\n", path, err)
@@ -139,23 +212,38 @@ func doEnqueueCmd() error {
 			fmt.Fprintf(os.Stderr, "warning: skipping %q: %v\n", absPath, err)
 			continue
 		}
+
+		// UPSERT: re-activate job if content changed
 		_, err = db.Exec(`
-			INSERT OR IGNORE INTO queue
-			(path, path_hash, content_hash, treatment, done_at, result, next_at)
+			INSERT INTO queue
+			  (path, path_hash, content_hash, treatment, done_at, result, next_at)
 			VALUES (?, ?, ?, ?, NULL, NULL, NULL)
+			ON CONFLICT(path_hash, treatment) DO UPDATE SET
+			  path         = excluded.path,
+			  content_hash = excluded.content_hash,
+			  done_at      = IIF(queue.content_hash = excluded.content_hash, queue.done_at, NULL),
+			  result       = IIF(queue.content_hash = excluded.content_hash, queue.result, NULL),
+			  next_at      = IIF(queue.content_hash = excluded.content_hash, queue.next_at, NULL)
 		`, absPath, ph, ch, *treatment)
 		if err != nil {
-			return fmt.Errorf("error: failed to insert %q: %w", absPath, err)
+			return fmt.Errorf("insert failed for %q: %w", absPath, err)
 		}
 		count++
 	}
-
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("error reading stdin: %w", err)
 	}
-
 	fmt.Printf("enqueued %d paths for treatment=%s\n", count, *treatment)
 	return nil
+}
+
+// ----------------------------------------
+// claim
+// ----------------------------------------
+
+type ClaimResult struct {
+	Path     string `json:"path"`
+	PathHash string `json:"path_hash,omitempty"`
 }
 
 func claimCmd() {
@@ -164,45 +252,96 @@ func claimCmd() {
 	cursor := fs.String("cursor", "", "resume after this path_hash")
 	n := fs.Int("n", 1, "number to claim")
 	dbPath := fs.String("db", defaultDBPath, "database path")
+	withHash := fs.Bool("with-hash", false, "print 'hash<TAB>path' for easier cursoring")
+	jsonOutput := fs.Bool("json", false, "output as JSON array")
+	shard := fs.Int("shard", -1, "shard number (0-based, requires --total-shards)")
+	totalShards := fs.Int("total-shards", 0, "total number of shards")
 	_ = fs.Parse(os.Args[2:])
+
+	// Validate sharding parameters
+	if (*shard >= 0 && *totalShards <= 0) || (*shard < 0 && *totalShards > 0) {
+		fmt.Fprintf(os.Stderr, "error: --shard and --total-shards must be used together\n")
+		os.Exit(1)
+	}
+	if *shard >= *totalShards {
+		fmt.Fprintf(os.Stderr, "error: --shard must be less than --total-shards\n")
+		os.Exit(1)
+	}
 
 	db, err := openDB(*dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 
-	rows, err := db.Query(`
-		SELECT path, path_hash FROM queue
-		WHERE treatment=? AND done_at IS NULL AND path_hash > ?
-		ORDER BY path_hash
-		LIMIT ?
-	`, *treatment, *cursor, *n)
+	// Build query with optional sharding
+	query := `
+		SELECT path, path_hash
+		  FROM queue
+		 WHERE treatment = ?
+		   AND done_at IS NULL
+		   AND path_hash > ?`
+
+	args := []any{*treatment, *cursor}
+
+	if *shard >= 0 {
+		shardStart, shardEnd := calculateShardRange(*shard, *totalShards)
+		query += `
+		   AND path_hash >= ?
+		   AND path_hash < ?`
+		args = append(args, shardStart, shardEnd)
+	}
+
+	query += `
+		 ORDER BY path_hash
+		 LIMIT ?`
+	args = append(args, *n)
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "query error: %v\n", err)
-		return
+		os.Exit(1)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
+	var results []ClaimResult
 	for rows.Next() {
 		var path, hash string
 		if err := rows.Scan(&path, &hash); err != nil {
 			continue
 		}
-		fmt.Println(path)
+		results = append(results, ClaimResult{Path: path, PathHash: hash})
 	}
-
 	if err := rows.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "rows error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(results)
+	} else {
+		for _, r := range results {
+			if *withHash {
+				fmt.Printf("%s\t%s\n", r.PathHash, r.Path)
+			} else {
+				fmt.Println(r.Path)
+			}
+		}
 	}
 }
+
+// ----------------------------------------
+// done
+// ----------------------------------------
 
 func doneCmd() {
 	fs := flag.NewFlagSet("done", flag.ExitOnError)
 	path := fs.String("path", "", "file path (required)")
 	result := fs.String("result", "", "result hash")
-	revisit := fs.String("revisit", "", "revisit after duration (e.g., '14 days')")
+	revisit := fs.String("revisit", "", "revisit after duration (e.g., '+14 days')")
 	treatment := fs.String("treatment", "default", "treatment name")
 	dbPath := fs.String("db", defaultDBPath, "database path")
 	_ = fs.Parse(os.Args[2:])
@@ -211,41 +350,56 @@ func doneCmd() {
 		fmt.Fprintf(os.Stderr, "error: --path required\n")
 		os.Exit(1)
 	}
-
 	absPath, err := filepath.Abs(*path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "path error: %v\n", err)
 		os.Exit(1)
 	}
+	ph := pathHash(absPath)
 
 	db, err := openDB(*dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	var nextAt *string
-	if *revisit != "" {
-		// SQLite datetime modifier
-		nextAt = revisit
-	}
 
-	_, err = db.Exec(`
-		UPDATE queue
-		SET done_at=?, result=?, next_at=DATETIME('now', ?)
-		WHERE path=? AND treatment=?
-	`, now, *result, nextAt, absPath, *treatment)
+	if *revisit == "" {
+		_, err = db.Exec(`
+			UPDATE queue
+			   SET done_at = ?, result = ?, next_at = NULL
+			 WHERE path_hash = ? AND treatment = ?
+		`, now, *result, ph, *treatment)
+	} else {
+		_, err = db.Exec(`
+			UPDATE queue
+			   SET done_at = ?, result = ?, next_at = DATETIME('now', ?)
+			 WHERE path_hash = ? AND treatment = ?
+		`, now, *result, *revisit, ph, *treatment)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "update error: %v\n", err)
+		os.Exit(1)
 	}
+}
+
+// ----------------------------------------
+// status
+// ----------------------------------------
+
+type StatusResult struct {
+	Treatment string `json:"treatment"`
+	Pending   int    `json:"pending"`
+	Done      int    `json:"done"`
 }
 
 func statusCmd() {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	treatment := fs.String("treatment", "", "filter by treatment (empty = all)")
 	dbPath := fs.String("db", defaultDBPath, "database path")
+	jsonOutput := fs.Bool("json", false, "output as JSON array")
 	_ = fs.Parse(os.Args[2:])
 
 	db, err := openDB(*dbPath)
@@ -253,42 +407,62 @@ func statusCmd() {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 
 	query := `
-		SELECT treatment, 
-		       COUNT(*) FILTER (WHERE done_at IS NULL) as pending,
-		       COUNT(*) FILTER (WHERE done_at IS NOT NULL) as done
-		FROM queue
-	`
-	args := []interface{}{}
+WITH stats AS (
+  SELECT treatment,
+         SUM(CASE WHEN done_at IS NULL THEN 1 ELSE 0 END) AS pending,
+         SUM(CASE WHEN done_at IS NOT NULL THEN 1 ELSE 0 END) AS done
+    FROM queue
+`
+	args := []any{}
 	if *treatment != "" {
-		query += " WHERE treatment=?"
+		query += "   WHERE treatment = ?\n"
 		args = append(args, *treatment)
 	}
-	query += " GROUP BY treatment"
+	query += "GROUP BY treatment)\n" +
+		"SELECT treatment, pending, done FROM stats\n" +
+		"UNION ALL\n" +
+		"SELECT 'TOTAL', SUM(pending), SUM(done) FROM stats\n" +
+		"ORDER BY (treatment = 'TOTAL'), treatment;"
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "query error: %v\n", err)
-		return
+		os.Exit(1)
 	}
-	defer func() { _ = rows.Close() }()
+	defer rows.Close()
 
-	fmt.Printf("%-20s %10s %10s\n", "TREATMENT", "PENDING", "DONE")
+	var results []StatusResult
 	for rows.Next() {
 		var t string
 		var pending, done int
 		if err := rows.Scan(&t, &pending, &done); err != nil {
 			continue
 		}
-		fmt.Printf("%-20s %10d %10d\n", t, pending, done)
+		results = append(results, StatusResult{Treatment: t, Pending: pending, Done: done})
 	}
-
 	if err := rows.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "rows error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(results)
+	} else {
+		fmt.Printf("%-20s %10s %10s\n", "TREATMENT", "PENDING", "DONE")
+		for _, r := range results {
+			fmt.Printf("%-20s %10d %10d\n", r.Treatment, r.Pending, r.Done)
+		}
 	}
 }
+
+// ----------------------------------------
+// reset
+// ----------------------------------------
 
 func resetCmd() {
 	fs := flag.NewFlagSet("reset", flag.ExitOnError)
@@ -301,7 +475,6 @@ func resetCmd() {
 		fmt.Fprintf(os.Stderr, "error: --treatment required\n")
 		os.Exit(1)
 	}
-
 	if !*confirm {
 		fmt.Printf("Delete all entries for treatment=%s? [y/N] ", *treatment)
 		var response string
@@ -317,12 +490,12 @@ func resetCmd() {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 
-	res, err := db.Exec("DELETE FROM queue WHERE treatment=?", *treatment)
+	res, err := db.Exec("DELETE FROM queue WHERE treatment = ?", *treatment)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "delete error: %v\n", err)
-		return
+		os.Exit(1)
 	}
 	n, _ := res.RowsAffected()
 	fmt.Printf("deleted %d entries\n", n)
