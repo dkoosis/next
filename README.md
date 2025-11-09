@@ -47,6 +47,40 @@ Due = `next_at < NOW()`
 
 ## Parallel workers
 
+### Using sharding (recommended)
+
+Sharding divides the hash space evenly across workers without coordination:
+
+```bash
+# Worker 1 (processes shard 0 of 4)
+while true; do
+  next claim --treatment=lint --shard=0 --total-shards=4 --n=10 | while read path; do
+    [ -z "$path" ] && break
+    result=$(./check "$path" | shasum -a 256)
+    next done --path="$path" --result="$result"
+  done
+  sleep 1
+done
+
+# Worker 2 (processes shard 1 of 4)
+while true; do
+  next claim --treatment=lint --shard=1 --total-shards=4 --n=10 | while read path; do
+    [ -z "$path" ] && break
+    result=$(./check "$path" | shasum -a 256)
+    next done --path="$path" --result="$result"
+  done
+  sleep 1
+done
+```
+
+Sharding benefits:
+- **No coordination needed** - each worker has a disjoint hash range
+- **Deterministic distribution** - same file always goes to same shard
+- **Simple scaling** - add workers by increasing shard count
+- **Efficient** - no database contention between shards
+
+### Using cursors (legacy)
+
 ```bash
 # Worker loop
 CURSOR=""
@@ -59,4 +93,4 @@ while path=$(next claim --treatment=lint --cursor="$CURSOR" --n=1); do
 done
 ```
 
-Use GNU parallel or separate machines - each with their own cursor.
+Use sharding instead for true parallelism without coordination overhead.

@@ -73,8 +73,20 @@ Commands:
 Examples:
   find . -name '*.go' | next enqueue --treatment=lint
   next claim --treatment=lint --json
+  next claim --treatment=lint --shard=0 --total-shards=4 --n=100
   next done --path=foo.go --result=abc123 --revisit='+14 days'
   next status --json
+
+Parallel processing with sharding:
+  # Worker 1
+  while true; do
+    next claim --treatment=lint --shard=0 --total-shards=4 | xargs -I{} sh -c 'process {}'
+  done
+
+  # Worker 2
+  while true; do
+    next claim --treatment=lint --shard=1 --total-shards=4 | xargs -I{} sh -c 'process {}'
+  done
 `)
 }
 
@@ -85,6 +97,30 @@ Examples:
 func pathHash(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
+}
+
+// calculateShardRange returns the hash range [start, end) for the given shard.
+// SHA256 hashes are 64 hex chars (256 bits). We divide the space evenly.
+func calculateShardRange(shard, totalShards int) (string, string) {
+	// Use the first 16 hex chars (64 bits) for simplicity
+	const hexDigits = 16
+	const maxVal = uint64(0xFFFFFFFFFFFFFFFF)
+
+	shardSize := maxVal / uint64(totalShards)
+	start := uint64(shard) * shardSize
+	var end uint64
+	if shard == totalShards-1 {
+		// Last shard goes to the end
+		end = maxVal
+	} else {
+		end = start + shardSize
+	}
+
+	// Convert to hex strings, padded to 16 chars, fill rest with zeros
+	startHex := fmt.Sprintf("%016x%048s", start, "")
+	endHex := fmt.Sprintf("%016x%048s", end, "")
+
+	return startHex, endHex
 }
 
 func fileHash(path string) (string, error) {
@@ -218,7 +254,19 @@ func claimCmd() {
 	dbPath := fs.String("db", defaultDBPath, "database path")
 	withHash := fs.Bool("with-hash", false, "print 'hash<TAB>path' for easier cursoring")
 	jsonOutput := fs.Bool("json", false, "output as JSON array")
+	shard := fs.Int("shard", -1, "shard number (0-based, requires --total-shards)")
+	totalShards := fs.Int("total-shards", 0, "total number of shards")
 	_ = fs.Parse(os.Args[2:])
+
+	// Validate sharding parameters
+	if (*shard >= 0 && *totalShards <= 0) || (*shard < 0 && *totalShards > 0) {
+		fmt.Fprintf(os.Stderr, "error: --shard and --total-shards must be used together\n")
+		os.Exit(1)
+	}
+	if *shard >= *totalShards {
+		fmt.Fprintf(os.Stderr, "error: --shard must be less than --total-shards\n")
+		os.Exit(1)
+	}
 
 	db, err := openDB(*dbPath)
 	if err != nil {
@@ -227,15 +275,30 @@ func claimCmd() {
 	}
 	defer db.Close()
 
-	rows, err := db.Query(`
+	// Build query with optional sharding
+	query := `
 		SELECT path, path_hash
 		  FROM queue
 		 WHERE treatment = ?
 		   AND done_at IS NULL
-		   AND path_hash > ?
+		   AND path_hash > ?`
+
+	args := []any{*treatment, *cursor}
+
+	if *shard >= 0 {
+		shardStart, shardEnd := calculateShardRange(*shard, *totalShards)
+		query += `
+		   AND path_hash >= ?
+		   AND path_hash < ?`
+		args = append(args, shardStart, shardEnd)
+	}
+
+	query += `
 		 ORDER BY path_hash
-		 LIMIT ?
-	`, *treatment, *cursor, *n)
+		 LIMIT ?`
+	args = append(args, *n)
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "query error: %v\n", err)
 		os.Exit(1)
