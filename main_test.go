@@ -374,8 +374,8 @@ func TestStatusCmd_ShowsCounts_When_FilteredByTreatment(t *testing.T) {
 	})
 
 	lines := strings.Split(strings.TrimSpace(output), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected header + 1 line, got %d", len(lines))
+	if len(lines) != 3 {
+		t.Fatalf("expected header + data + total, got %d", len(lines))
 	}
 
 	fields := strings.Fields(lines[1])
