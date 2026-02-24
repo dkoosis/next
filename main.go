@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"database/sql"
-	"embed"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -19,22 +19,7 @@ import (
 )
 
 //go:embed schema.sql
-var embeddedSchemaFS embed.FS
-
-const fallbackSchema = `
-CREATE TABLE IF NOT EXISTS queue (
-  path          TEXT NOT NULL,
-  path_hash     TEXT NOT NULL,
-  content_hash  TEXT NOT NULL,
-  treatment     TEXT NOT NULL,
-  done_at       TEXT,
-  result        TEXT,
-  next_at       TEXT,
-  PRIMARY KEY (path_hash, treatment)
-);
-CREATE INDEX IF NOT EXISTS idx_queue_treatment_done ON queue(treatment, done_at);
-CREATE INDEX IF NOT EXISTS idx_queue_next_at ON queue(next_at);
-`
+var embeddedSchema string
 
 const defaultDBPath = ".quality/ledger.db"
 
@@ -102,8 +87,6 @@ func pathHash(s string) string {
 // calculateShardRange returns the hash range [start, end) for the given shard.
 // SHA256 hashes are 64 hex chars (256 bits). We divide the space evenly.
 func calculateShardRange(shard, totalShards int) (string, string) {
-	// Use the first 16 hex chars (64 bits) for simplicity
-	const hexDigits = 16
 	const maxVal = uint64(0xFFFFFFFFFFFFFFFF)
 
 	shardSize := maxVal / uint64(totalShards)
@@ -149,8 +132,7 @@ func openDB(path string) (*sql.DB, error) {
 		return nil, err
 	}
 
-	schema := readEmbeddedSchemaOrFallback()
-	if _, execErr := db.Exec(schema); execErr != nil {
+	if _, execErr := db.Exec(embeddedSchema); execErr != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("schema execution failed: %w", execErr)
 	}
@@ -164,25 +146,11 @@ func openDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-func readEmbeddedSchemaOrFallback() string {
-	if b, err := embeddedSchemaFS.ReadFile("schema.sql"); err == nil && len(b) > 0 {
-		return string(b)
-	}
-	return fallbackSchema
-}
-
 // ----------------------------------------
 // enqueue
 // ----------------------------------------
 
 func enqueueCmd() {
-	if err := doEnqueueCmd(); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
-}
-
-func doEnqueueCmd() error {
 	fs := flag.NewFlagSet("enqueue", flag.ExitOnError)
 	treatment := fs.String("treatment", "default", "treatment name")
 	dbPath := fs.String("db", defaultDBPath, "database path")
@@ -190,7 +158,8 @@ func doEnqueueCmd() error {
 
 	db, err := openDB(*dbPath)
 	if err != nil {
-		return fmt.Errorf("db error: %w", err)
+		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
@@ -226,15 +195,16 @@ func doEnqueueCmd() error {
 			  next_at      = IIF(queue.content_hash = excluded.content_hash, queue.next_at, NULL)
 		`, absPath, ph, ch, *treatment)
 		if err != nil {
-			return fmt.Errorf("insert failed for %q: %w", absPath, err)
+			fmt.Fprintf(os.Stderr, "insert failed for %q: %v\n", absPath, err)
+			os.Exit(1)
 		}
 		count++
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading stdin: %w", err)
+		fmt.Fprintf(os.Stderr, "error reading stdin: %v\n", err)
+		os.Exit(1)
 	}
 	fmt.Printf("enqueued %d paths for treatment=%s\n", count, *treatment)
-	return nil
 }
 
 // ----------------------------------------
@@ -422,10 +392,10 @@ WITH stats AS (
 		args = append(args, *treatment)
 	}
 	query += "GROUP BY treatment)\n" +
-		"SELECT treatment, pending, done FROM stats\n" +
+		"SELECT treatment, pending, done, 0 AS sort_order FROM stats\n" +
 		"UNION ALL\n" +
-		"SELECT 'TOTAL', SUM(pending), SUM(done) FROM stats\n" +
-		"ORDER BY (treatment = 'TOTAL'), treatment;"
+		"SELECT 'TOTAL', SUM(pending), SUM(done), 1 FROM stats\n" +
+		"ORDER BY sort_order, treatment;"
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -437,8 +407,8 @@ WITH stats AS (
 	var results []StatusResult
 	for rows.Next() {
 		var t string
-		var pending, done int
-		if err := rows.Scan(&t, &pending, &done); err != nil {
+		var pending, done, sortOrder int
+		if err := rows.Scan(&t, &pending, &done, &sortOrder); err != nil {
 			continue
 		}
 		results = append(results, StatusResult{Treatment: t, Pending: pending, Done: done})
