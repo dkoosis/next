@@ -374,8 +374,8 @@ func TestStatusCmd_ShowsCounts_When_FilteredByTreatment(t *testing.T) {
 	})
 
 	lines := strings.Split(strings.TrimSpace(output), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected header + 1 line, got %d", len(lines))
+	if len(lines) != 3 {
+		t.Fatalf("expected header + data + total, got %d", len(lines))
 	}
 
 	fields := strings.Fields(lines[1])
@@ -521,3 +521,172 @@ func TestDoneCmd_MarksEntryDone_When_PathProvided(t *testing.T) {
 		t.Fatalf("expected next_at NULL, got %v", nextAt)
 	}
 }
+
+// ----------------------------------------
+// Sharding tests
+// ----------------------------------------
+
+func TestCalculateShardRange_ReturnsCorrectRanges_When_TwoShards(t *testing.T) {
+	t.Parallel()
+
+	start0, end0 := calculateShardRange(0, 2)
+	start1, end1 := calculateShardRange(1, 2)
+
+	// Verify first shard starts at 0
+	expectedStart0 := "0000000000000000000000000000000000000000000000000000000000000000"
+	if start0 != expectedStart0 {
+		t.Fatalf("shard 0 start = %s, want %s", start0, expectedStart0)
+	}
+
+	// Verify shards are contiguous
+	if end0 != start1 {
+		t.Fatalf("shard 0 end (%s) != shard 1 start (%s)", end0, start1)
+	}
+
+	// Verify last shard ends at max
+	expectedEnd1 := "ffffffffffffffff000000000000000000000000000000000000000000000000"
+	if end1 != expectedEnd1 {
+		t.Fatalf("shard 1 end = %s, want %s", end1, expectedEnd1)
+	}
+
+	// Verify no overlap
+	if start0 >= end0 {
+		t.Fatalf("shard 0 start >= end")
+	}
+	if start1 >= end1 {
+		t.Fatalf("shard 1 start >= end")
+	}
+}
+
+func TestCalculateShardRange_ReturnsCorrectRanges_When_FourShards(t *testing.T) {
+	t.Parallel()
+
+	ranges := make([][2]string, 4)
+	for i := 0; i < 4; i++ {
+		start, end := calculateShardRange(i, 4)
+		ranges[i] = [2]string{start, end}
+	}
+
+	// Verify first shard starts at 0
+	if ranges[0][0] != "0000000000000000000000000000000000000000000000000000000000000000" {
+		t.Fatalf("first shard doesn't start at 0: %s", ranges[0][0])
+	}
+
+	// Verify all shards are contiguous
+	for i := 0; i < 3; i++ {
+		if ranges[i][1] != ranges[i+1][0] {
+			t.Fatalf("shard %d end (%s) != shard %d start (%s)", i, ranges[i][1], i+1, ranges[i+1][0])
+		}
+	}
+
+	// Verify last shard ends at max
+	if ranges[3][1] != "ffffffffffffffff000000000000000000000000000000000000000000000000" {
+		t.Fatalf("last shard doesn't end at max: %s", ranges[3][1])
+	}
+}
+
+func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
+	tmpDir, restore := setupWorkDir(t, true)
+	defer restore()
+
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	// Create many files to ensure hash distribution across shards
+	numFiles := 100
+	type fileInfo struct {
+		path string
+		hash string
+	}
+	var files []fileInfo
+
+	for i := 0; i < numFiles; i++ {
+		path := filepath.Join(tmpDir, fmt.Sprintf("file-%03d.txt", i))
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("content-%d", i)), 0o600); err != nil {
+			t.Fatalf("write file %d: %v", i, err)
+		}
+		hash := pathHash(path)
+		files = append(files, fileInfo{path: path, hash: hash})
+
+		if _, err := db.Exec(`
+			INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
+			VALUES (?, ?, ?, ?, NULL, NULL, NULL)
+		`, path, hash, fmt.Sprintf("content-hash-%d", i), "lint"); err != nil {
+			t.Fatalf("insert file %d: %v", i, err)
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	// Test with 4 shards
+	const totalShards = 4
+	allResults := make(map[string]bool)
+	var shardCounts [totalShards]int
+
+	for shard := 0; shard < totalShards; shard++ {
+		oldArgs := os.Args
+		os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
+			"--shard", fmt.Sprintf("%d", shard), "--total-shards", fmt.Sprintf("%d", totalShards),
+			"--n", "1000"} // Request all items
+		defer func() { os.Args = oldArgs }()
+
+		output := captureStdout(t, func() {
+			claimCmd()
+		})
+
+		lines := strings.Split(strings.TrimSpace(output), "\n")
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed != "" {
+				allResults[trimmed] = true
+				shardCounts[shard]++
+			}
+		}
+		os.Args = oldArgs
+	}
+
+	// Verify all files were returned across shards
+	if len(allResults) != numFiles {
+		t.Fatalf("got %d unique results across all shards, want %d", len(allResults), numFiles)
+	}
+
+	// Verify each shard got some items (probabilistic, but should be true for 100 files)
+	for i := 0; i < totalShards; i++ {
+		if shardCounts[i] == 0 {
+			t.Fatalf("shard %d returned 0 items", i)
+		}
+	}
+
+	// Verify no overlap between shards by checking each file appears in exactly one shard
+	fileToShard := make(map[string]int)
+	for shard := 0; shard < totalShards; shard++ {
+		oldArgs := os.Args
+		os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
+			"--shard", fmt.Sprintf("%d", shard), "--total-shards", fmt.Sprintf("%d", totalShards),
+			"--n", "1000"}
+
+		output := captureStdout(t, func() {
+			claimCmd()
+		})
+
+		lines := strings.Split(strings.TrimSpace(output), "\n")
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed != "" {
+				if prevShard, exists := fileToShard[trimmed]; exists {
+					t.Fatalf("file %s appeared in both shard %d and shard %d", trimmed, prevShard, shard)
+				}
+				fileToShard[trimmed] = shard
+			}
+		}
+		os.Args = oldArgs
+	}
+}
+
+// Note: Error validation for invalid shard parameters is tested manually
+// since os.Exit makes it difficult to test programmatically
