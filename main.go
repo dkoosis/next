@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	_ "embed"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/ncruces/go-sqlite3/driver"
@@ -86,22 +88,22 @@ func pathHash(s string) string {
 
 // calculateShardRange returns the hash range [start, end) for the given shard.
 // SHA256 hashes are 64 hex chars (256 bits). We divide the space evenly.
-func calculateShardRange(shard, totalShards int) (string, string) {
+func calculateShardRange(shard, totalShards int) (startHex, endHex string) {
 	const maxVal = uint64(0xFFFFFFFFFFFFFFFF)
 
-	shardSize := maxVal / uint64(totalShards)
-	start := uint64(shard) * shardSize
+	shardSize := maxVal / uint64(totalShards) // #nosec G115 -- totalShards is validated positive before call
+	start := uint64(shard) * shardSize        // #nosec G115 -- shard is validated non-negative before call
 	var end uint64
 	if shard == totalShards-1 {
-		// Last shard goes to the end
+		// Last shard goes to the end.
 		end = maxVal
 	} else {
 		end = start + shardSize
 	}
 
-	// Convert to hex strings, padded to 16 chars, fill rest with zeros
-	startHex := fmt.Sprintf("%016x%048s", start, "")
-	endHex := fmt.Sprintf("%016x%048s", end, "")
+	// Convert to hex strings, padded to 64 chars total (16 hex + 48 zeros).
+	startHex = fmt.Sprintf("%016x", start) + strings.Repeat("0", 48)
+	endHex = fmt.Sprintf("%016x", end) + strings.Repeat("0", 48)
 
 	return startHex, endHex
 }
@@ -111,9 +113,13 @@ func fileHash(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err = io.Copy(h, f); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -124,7 +130,7 @@ func fileHash(path string) (string, error) {
 // ----------------------------------------
 
 func openDB(path string) (*sql.DB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
 	}
 	db, err := sql.Open("sqlite3", path)
@@ -132,17 +138,18 @@ func openDB(path string) (*sql.DB, error) {
 		return nil, err
 	}
 
-	if _, execErr := db.Exec(embeddedSchema); execErr != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("schema execution failed: %w", execErr)
-	}
-
-	if _, execErr := db.Exec(`PRAGMA journal_mode=WAL;`); execErr != nil {
+	ctx := context.Background()
+	if _, execErr := db.ExecContext(ctx, `PRAGMA journal_mode=WAL;`); execErr != nil {
 		_ = db.Close()
 		return nil, execErr
 	}
-	_, _ = db.Exec(`PRAGMA busy_timeout=3000;`)
-	_, _ = db.Exec(`PRAGMA foreign_keys=ON;`)
+	_, _ = db.ExecContext(ctx, `PRAGMA busy_timeout=3000;`)
+	_, _ = db.ExecContext(ctx, `PRAGMA foreign_keys=ON;`)
+
+	if _, execErr := db.ExecContext(ctx, embeddedSchema); execErr != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("schema execution failed: %w", execErr)
+	}
 	return db, nil
 }
 
@@ -161,7 +168,33 @@ func enqueueCmd() {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		_ = db.Close()
+		fmt.Fprintf(os.Stderr, "begin tx: %v\n", err)
+		os.Exit(1)
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO queue
+		  (path, path_hash, content_hash, treatment, done_at, result, next_at)
+		VALUES (?, ?, ?, ?, NULL, NULL, NULL)
+		ON CONFLICT(path_hash, treatment) DO UPDATE SET
+		  path         = excluded.path,
+		  content_hash = excluded.content_hash,
+		  done_at      = IIF(queue.content_hash = excluded.content_hash, queue.done_at, NULL),
+		  result       = IIF(queue.content_hash = excluded.content_hash, queue.result, NULL),
+		  next_at      = IIF(queue.content_hash = excluded.content_hash, queue.next_at, NULL)
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		_ = db.Close()
+		fmt.Fprintf(os.Stderr, "prepare: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = stmt.Close() }()
 
 	scanner := bufio.NewScanner(os.Stdin)
 	count := 0
@@ -182,35 +215,34 @@ func enqueueCmd() {
 			continue
 		}
 
-		// UPSERT: re-activate job if content changed
-		_, err = db.Exec(`
-			INSERT INTO queue
-			  (path, path_hash, content_hash, treatment, done_at, result, next_at)
-			VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-			ON CONFLICT(path_hash, treatment) DO UPDATE SET
-			  path         = excluded.path,
-			  content_hash = excluded.content_hash,
-			  done_at      = IIF(queue.content_hash = excluded.content_hash, queue.done_at, NULL),
-			  result       = IIF(queue.content_hash = excluded.content_hash, queue.result, NULL),
-			  next_at      = IIF(queue.content_hash = excluded.content_hash, queue.next_at, NULL)
-		`, absPath, ph, ch, *treatment)
-		if err != nil {
+		if _, err := stmt.ExecContext(ctx, absPath, ph, ch, *treatment); err != nil {
+			_ = tx.Rollback()
+			_ = db.Close()
 			fmt.Fprintf(os.Stderr, "insert failed for %q: %v\n", absPath, err)
 			os.Exit(1)
 		}
 		count++
 	}
 	if err := scanner.Err(); err != nil {
+		_ = tx.Rollback()
+		_ = db.Close()
 		fmt.Fprintf(os.Stderr, "error reading stdin: %v\n", err)
 		os.Exit(1)
 	}
+	if err := tx.Commit(); err != nil {
+		_ = db.Close()
+		fmt.Fprintf(os.Stderr, "commit: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("enqueued %d paths for treatment=%s\n", count, *treatment)
+	_ = db.Close()
 }
 
 // ----------------------------------------
 // claim
 // ----------------------------------------
 
+// ClaimResult holds a claimed path and its hash.
 type ClaimResult struct {
 	Path     string `json:"path"`
 	PathHash string `json:"path_hash,omitempty"`
@@ -228,7 +260,7 @@ func claimCmd() {
 	totalShards := fs.Int("total-shards", 0, "total number of shards")
 	_ = fs.Parse(os.Args[2:])
 
-	// Validate sharding parameters
+	// Validate sharding parameters.
 	if (*shard >= 0 && *totalShards <= 0) || (*shard < 0 && *totalShards > 0) {
 		fmt.Fprintf(os.Stderr, "error: --shard and --total-shards must be used together\n")
 		os.Exit(1)
@@ -243,9 +275,11 @@ func claimCmd() {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
-	// Build query with optional sharding
+	ctx := context.Background()
+
+	// Build query with optional sharding.
 	query := `
 		SELECT path, path_hash
 		  FROM queue
@@ -268,17 +302,18 @@ func claimCmd() {
 		 LIMIT ?`
 	args = append(args, *n)
 
-	rows, err := db.Query(query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "query error: %v\n", err)
 		os.Exit(1)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []ClaimResult
 	for rows.Next() {
 		var path, hash string
 		if err := rows.Scan(&path, &hash); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: scan error: %v\n", err)
 			continue
 		}
 		results = append(results, ClaimResult{Path: path, PathHash: hash})
@@ -332,18 +367,19 @@ func doneCmd() {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
+	ctx := context.Background()
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	if *revisit == "" {
-		_, err = db.Exec(`
+		_, err = db.ExecContext(ctx, `
 			UPDATE queue
 			   SET done_at = ?, result = ?, next_at = NULL
 			 WHERE path_hash = ? AND treatment = ?
 		`, now, *result, ph, *treatment)
 	} else {
-		_, err = db.Exec(`
+		_, err = db.ExecContext(ctx, `
 			UPDATE queue
 			   SET done_at = ?, result = ?, next_at = DATETIME('now', ?)
 			 WHERE path_hash = ? AND treatment = ?
@@ -359,6 +395,7 @@ func doneCmd() {
 // status
 // ----------------------------------------
 
+// StatusResult holds per-treatment queue statistics.
 type StatusResult struct {
 	Treatment string `json:"treatment"`
 	Pending   int    `json:"pending"`
@@ -377,7 +414,9 @@ func statusCmd() {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
+
+	ctx := context.Background()
 
 	query := `
 WITH stats AS (
@@ -397,12 +436,12 @@ WITH stats AS (
 		"SELECT 'TOTAL', SUM(pending), SUM(done), 1 FROM stats\n" +
 		"ORDER BY sort_order, treatment;"
 
-	rows, err := db.Query(query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "query error: %v\n", err)
 		os.Exit(1)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []StatusResult
 	for rows.Next() {
@@ -460,9 +499,10 @@ func resetCmd() {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
-	res, err := db.Exec("DELETE FROM queue WHERE treatment = ?", *treatment)
+	ctx := context.Background()
+	res, err := db.ExecContext(ctx, "DELETE FROM queue WHERE treatment = ?", *treatment)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "delete error: %v\n", err)
 		os.Exit(1)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -25,18 +26,6 @@ func setupWorkDir(t *testing.T, withSchema bool) (dir string, cleanup func()) {
 		qualityDir := filepath.Join(tmpDir, ".quality")
 		if err := os.MkdirAll(qualityDir, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
-		}
-		schema := `CREATE TABLE IF NOT EXISTS queue (
-    path TEXT PRIMARY KEY,
-    path_hash TEXT NOT NULL,
-    content_hash TEXT NOT NULL,
-    treatment TEXT NOT NULL,
-    done_at TEXT,
-    result TEXT,
-    next_at TEXT
-);`
-		if err := os.WriteFile(filepath.Join(qualityDir, "schema.sql"), []byte(schema), 0o600); err != nil {
-			t.Fatalf("write schema: %v", err)
 		}
 	}
 
@@ -124,7 +113,7 @@ func TestOpenDB_CreatesSchema_When_SchemaPresent(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	var journalMode string
-	if err := db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
+	if err := db.QueryRowContext(context.Background(), "PRAGMA journal_mode;").Scan(&journalMode); err != nil {
 		t.Fatalf("query journal_mode: %v", err)
 	}
 	if !strings.EqualFold(journalMode, "wal") {
@@ -150,7 +139,7 @@ func TestOpenDB_ReturnsDB_When_SchemaMissing(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := db.Ping(); err != nil {
+	if err := db.PingContext(context.Background()); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
 }
@@ -208,7 +197,7 @@ func TestEnqueueCmd_InsertsRows_When_InputContainsValidPaths(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	row := db.QueryRow("SELECT path, content_hash FROM queue WHERE treatment=?", "lint")
+	row := db.QueryRowContext(context.Background(), "SELECT path, content_hash FROM queue WHERE treatment=?", "lint")
 	var storedPath, storedHash string
 	if scanErr := row.Scan(&storedPath, &storedHash); scanErr != nil {
 		t.Fatalf("scan: %v", scanErr)
@@ -224,7 +213,7 @@ func TestEnqueueCmd_InsertsRows_When_InputContainsValidPaths(t *testing.T) {
 		t.Fatalf("stored hash = %s, want %s", storedHash, wantHash)
 	}
 
-	countRow := db.QueryRow("SELECT COUNT(*) FROM queue")
+	countRow := db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM queue")
 	var count int
 	if err := countRow.Scan(&count); err != nil {
 		t.Fatalf("count scan: %v", err)
@@ -597,11 +586,6 @@ func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 
 	// Create many files to ensure hash distribution across shards
 	numFiles := 100
-	type fileInfo struct {
-		path string
-		hash string
-	}
-	var files []fileInfo
 
 	for i := 0; i < numFiles; i++ {
 		path := filepath.Join(tmpDir, fmt.Sprintf("file-%03d.txt", i))
@@ -609,7 +593,6 @@ func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 			t.Fatalf("write file %d: %v", i, err)
 		}
 		hash := pathHash(path)
-		files = append(files, fileInfo{path: path, hash: hash})
 
 		if _, err := db.Exec(`
 			INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
@@ -632,8 +615,7 @@ func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 		oldArgs := os.Args
 		os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
 			"--shard", fmt.Sprintf("%d", shard), "--total-shards", fmt.Sprintf("%d", totalShards),
-			"--n", "1000"} // Request all items
-		defer func() { os.Args = oldArgs }()
+			"--n", "1000"} // Request all items.
 
 		output := captureStdout(t, func() {
 			claimCmd()
