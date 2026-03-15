@@ -9,17 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-func setupWorkDir(t *testing.T, withSchema bool) (dir string, cleanup func()) {
+func setupWorkDir(t *testing.T, withSchema bool) string {
 	t.Helper()
-	oldWD, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
 
 	tmpDir := t.TempDir()
 	if withSchema {
@@ -29,15 +26,9 @@ func setupWorkDir(t *testing.T, withSchema bool) (dir string, cleanup func()) {
 		}
 	}
 
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
+	t.Chdir(tmpDir)
 
-	return tmpDir, func() {
-		if err := os.Chdir(oldWD); err != nil {
-			t.Fatalf("restore chdir: %v", err)
-		}
-	}
+	return tmpDir
 }
 
 func captureStdout(t *testing.T, fn func()) string {
@@ -71,6 +62,12 @@ func captureStdout(t *testing.T, fn func()) string {
 	return buf.String()
 }
 
+//nolint:dupword // SQL NULL repetition is intentional
+const testInsertSQL = `
+	INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
+	VALUES (?, ?, ?, ?, NULL, NULL, NULL)
+`
+
 func TestFileHash_ReturnsDigest_When_FileReadable(t *testing.T) {
 	t.Parallel()
 
@@ -86,7 +83,7 @@ func TestFileHash_ReturnsDigest_When_FileReadable(t *testing.T) {
 		t.Fatalf("fileHash error: %v", err)
 	}
 
-	// Known SHA-256 digest for "hello world\n"
+	// Known SHA-256 digest for "hello world\n".
 	const want = "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
 	if got != want {
 		t.Fatalf("fileHash = %s, want %s", got, want)
@@ -102,8 +99,7 @@ func TestFileHash_ReturnsError_When_FileMissing(t *testing.T) {
 }
 
 func TestOpenDB_CreatesSchema_When_SchemaPresent(t *testing.T) {
-	tmpDir, restore := setupWorkDir(t, true)
-	defer restore()
+	tmpDir := setupWorkDir(t, true)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -120,17 +116,14 @@ func TestOpenDB_CreatesSchema_When_SchemaPresent(t *testing.T) {
 		t.Fatalf("journal mode = %s, want wal", journalMode)
 	}
 
-	if _, err := db.Exec(`
-        INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
-        VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-    `, "/tmp/file", pathHash("/tmp/file"), "hash", "lint"); err != nil {
+	if _, err := db.Exec(testInsertSQL,
+		"/tmp/file", pathHash("/tmp/file"), "hash", "lint"); err != nil {
 		t.Fatalf("insert queue: %v", err)
 	}
 }
 
 func TestOpenDB_ReturnsDB_When_SchemaMissing(t *testing.T) {
-	tmpDir, restore := setupWorkDir(t, false)
-	defer restore()
+	tmpDir := setupWorkDir(t, false)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -145,8 +138,7 @@ func TestOpenDB_ReturnsDB_When_SchemaMissing(t *testing.T) {
 }
 
 func TestEnqueueCmd_InsertsRows_When_InputContainsValidPaths(t *testing.T) {
-	tmpDir, restore := setupWorkDir(t, true)
-	defer restore()
+	tmpDir := setupWorkDir(t, true)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 
@@ -185,8 +177,6 @@ func TestEnqueueCmd_InsertsRows_When_InputContainsValidPaths(t *testing.T) {
 		enqueueCmd()
 	})
 
-	// Duplicate entries still increment the reported count because INSERT OR IGNORE
-	// does not return an error for ignored rows.
 	if !strings.Contains(output, "enqueued 2 paths for treatment=lint") {
 		t.Fatalf("unexpected output: %q", output)
 	}
@@ -224,8 +214,7 @@ func TestEnqueueCmd_InsertsRows_When_InputContainsValidPaths(t *testing.T) {
 }
 
 func TestClaimCmd_PrintsPendingPaths_When_CursorSpecified(t *testing.T) {
-	tmpDir, restore := setupWorkDir(t, true)
-	defer restore()
+	tmpDir := setupWorkDir(t, true)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -244,13 +233,11 @@ func TestClaimCmd_PrintsPendingPaths_When_CursorSpecified(t *testing.T) {
 	}
 	candidates := make([]candidate, 0, len(paths))
 	for i, p := range paths {
-		if err := os.WriteFile(p, []byte(fmt.Sprintf("file-%d", i)), 0o600); err != nil {
+		if err := os.WriteFile(p, fmt.Appendf(nil, "file-%d", i), 0o600); err != nil {
 			t.Fatalf("write file %s: %v", p, err)
 		}
-		if _, err := db.Exec(`
-            INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
-        VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-        `, p, pathHash(p), fmt.Sprintf("hash-%d", i), "lint"); err != nil {
+		if _, err := db.Exec(testInsertSQL,
+			p, pathHash(p), fmt.Sprintf("hash-%d", i), "lint"); err != nil {
 			t.Fatalf("insert %s: %v", p, err)
 		}
 		candidates = append(candidates, candidate{path: p, hash: pathHash(p)})
@@ -308,8 +295,7 @@ func TestClaimCmd_PrintsPendingPaths_When_CursorSpecified(t *testing.T) {
 }
 
 func TestStatusCmd_ShowsCounts_When_FilteredByTreatment(t *testing.T) {
-	tmpDir, restore := setupWorkDir(t, true)
-	defer restore()
+	tmpDir := setupWorkDir(t, true)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -321,10 +307,8 @@ func TestStatusCmd_ShowsCounts_When_FilteredByTreatment(t *testing.T) {
 	if err := os.WriteFile(pendingPath, []byte("pending"), 0o600); err != nil {
 		t.Fatalf("write pending: %v", err)
 	}
-	if _, err := db.Exec(`
-        INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
-        VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-    `, pendingPath, pathHash(pendingPath), "hash-pending", "lint"); err != nil {
+	if _, err := db.Exec(testInsertSQL,
+		pendingPath, pathHash(pendingPath), "hash-pending", "lint"); err != nil {
 		t.Fatalf("insert pending: %v", err)
 	}
 
@@ -343,10 +327,8 @@ func TestStatusCmd_ShowsCounts_When_FilteredByTreatment(t *testing.T) {
 	if err := os.WriteFile(otherPath, []byte("other"), 0o600); err != nil {
 		t.Fatalf("write other: %v", err)
 	}
-	if _, err := db.Exec(`
-        INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
-        VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-    `, otherPath, pathHash(otherPath), "hash-other", "other"); err != nil {
+	if _, err := db.Exec(testInsertSQL,
+		otherPath, pathHash(otherPath), "hash-other", "other"); err != nil {
 		t.Fatalf("insert other: %v", err)
 	}
 
@@ -383,8 +365,7 @@ func TestStatusCmd_ShowsCounts_When_FilteredByTreatment(t *testing.T) {
 }
 
 func TestResetCmd_DeletesEntries_When_Confirmed(t *testing.T) {
-	tmpDir, restore := setupWorkDir(t, true)
-	defer restore()
+	tmpDir := setupWorkDir(t, true)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -396,10 +377,8 @@ func TestResetCmd_DeletesEntries_When_Confirmed(t *testing.T) {
 	if writeErr := os.WriteFile(lintPath, []byte("lint"), 0o600); writeErr != nil {
 		t.Fatalf("write lint: %v", writeErr)
 	}
-	if _, execErr := db.Exec(`
-        INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
-        VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-    `, lintPath, pathHash(lintPath), "hash-lint", "lint"); execErr != nil {
+	if _, execErr := db.Exec(testInsertSQL,
+		lintPath, pathHash(lintPath), "hash-lint", "lint"); execErr != nil {
 		t.Fatalf("insert lint: %v", execErr)
 	}
 
@@ -407,10 +386,8 @@ func TestResetCmd_DeletesEntries_When_Confirmed(t *testing.T) {
 	if writeErr2 := os.WriteFile(otherPath, []byte("other"), 0o600); writeErr2 != nil {
 		t.Fatalf("write other: %v", writeErr2)
 	}
-	if _, execErr2 := db.Exec(`
-        INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
-        VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-    `, otherPath, pathHash(otherPath), "hash-other", "other"); execErr2 != nil {
+	if _, execErr2 := db.Exec(testInsertSQL,
+		otherPath, pathHash(otherPath), "hash-other", "other"); execErr2 != nil {
 		t.Fatalf("insert other: %v", execErr2)
 	}
 
@@ -454,8 +431,7 @@ func TestResetCmd_DeletesEntries_When_Confirmed(t *testing.T) {
 }
 
 func TestDoneCmd_MarksEntryDone_When_PathProvided(t *testing.T) {
-	tmpDir, restore := setupWorkDir(t, true)
-	defer restore()
+	tmpDir := setupWorkDir(t, true)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -472,10 +448,8 @@ func TestDoneCmd_MarksEntryDone_When_PathProvided(t *testing.T) {
 		t.Fatalf("abs target: %v", absErr)
 	}
 
-	if _, execErr := db.Exec(`
-        INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
-        VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-    `, absTarget, pathHash(absTarget), "hash-target", "lint"); execErr != nil {
+	if _, execErr := db.Exec(testInsertSQL,
+		absTarget, pathHash(absTarget), "hash-target", "lint"); execErr != nil {
 		t.Fatalf("insert target: %v", execErr)
 	}
 
@@ -521,24 +495,24 @@ func TestCalculateShardRange_ReturnsCorrectRanges_When_TwoShards(t *testing.T) {
 	start0, end0 := calculateShardRange(0, 2)
 	start1, end1 := calculateShardRange(1, 2)
 
-	// Verify first shard starts at 0
+	// Verify first shard starts at 0.
 	expectedStart0 := "0000000000000000000000000000000000000000000000000000000000000000"
 	if start0 != expectedStart0 {
 		t.Fatalf("shard 0 start = %s, want %s", start0, expectedStart0)
 	}
 
-	// Verify shards are contiguous
+	// Verify shards are contiguous.
 	if end0 != start1 {
 		t.Fatalf("shard 0 end (%s) != shard 1 start (%s)", end0, start1)
 	}
 
-	// Verify last shard ends at max
+	// Verify last shard ends at max.
 	expectedEnd1 := "ffffffffffffffff000000000000000000000000000000000000000000000000"
 	if end1 != expectedEnd1 {
 		t.Fatalf("shard 1 end = %s, want %s", end1, expectedEnd1)
 	}
 
-	// Verify no overlap
+	// Verify no overlap.
 	if start0 >= end0 {
 		t.Fatalf("shard 0 start >= end")
 	}
@@ -551,32 +525,31 @@ func TestCalculateShardRange_ReturnsCorrectRanges_When_FourShards(t *testing.T) 
 	t.Parallel()
 
 	ranges := make([][2]string, 4)
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		start, end := calculateShardRange(i, 4)
 		ranges[i] = [2]string{start, end}
 	}
 
-	// Verify first shard starts at 0
+	// Verify first shard starts at 0.
 	if ranges[0][0] != "0000000000000000000000000000000000000000000000000000000000000000" {
 		t.Fatalf("first shard doesn't start at 0: %s", ranges[0][0])
 	}
 
-	// Verify all shards are contiguous
-	for i := 0; i < 3; i++ {
+	// Verify all shards are contiguous.
+	for i := range 3 {
 		if ranges[i][1] != ranges[i+1][0] {
 			t.Fatalf("shard %d end (%s) != shard %d start (%s)", i, ranges[i][1], i+1, ranges[i+1][0])
 		}
 	}
 
-	// Verify last shard ends at max
+	// Verify last shard ends at max.
 	if ranges[3][1] != "ffffffffffffffff000000000000000000000000000000000000000000000000" {
 		t.Fatalf("last shard doesn't end at max: %s", ranges[3][1])
 	}
 }
 
 func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
-	tmpDir, restore := setupWorkDir(t, true)
-	defer restore()
+	tmpDir := setupWorkDir(t, true)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -584,20 +557,18 @@ func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 		t.Fatalf("openDB: %v", err)
 	}
 
-	// Create many files to ensure hash distribution across shards
+	// Create many files to ensure hash distribution across shards.
 	numFiles := 100
 
-	for i := 0; i < numFiles; i++ {
+	for i := range numFiles {
 		path := filepath.Join(tmpDir, fmt.Sprintf("file-%03d.txt", i))
-		if err := os.WriteFile(path, []byte(fmt.Sprintf("content-%d", i)), 0o600); err != nil {
+		if err := os.WriteFile(path, fmt.Appendf(nil, "content-%d", i), 0o600); err != nil {
 			t.Fatalf("write file %d: %v", i, err)
 		}
 		hash := pathHash(path)
 
-		if _, err := db.Exec(`
-			INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
-			VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-		`, path, hash, fmt.Sprintf("content-hash-%d", i), "lint"); err != nil {
+		if _, err := db.Exec(testInsertSQL,
+			path, hash, fmt.Sprintf("content-hash-%d", i), "lint"); err != nil {
 			t.Fatalf("insert file %d: %v", i, err)
 		}
 	}
@@ -606,23 +577,22 @@ func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 		t.Fatalf("close db: %v", err)
 	}
 
-	// Test with 4 shards
+	// Test with 4 shards.
 	const totalShards = 4
 	allResults := make(map[string]bool)
 	var shardCounts [totalShards]int
 
-	for shard := 0; shard < totalShards; shard++ {
+	for shard := range totalShards {
 		oldArgs := os.Args
 		os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
-			"--shard", fmt.Sprintf("%d", shard), "--total-shards", fmt.Sprintf("%d", totalShards),
+			"--shard", strconv.Itoa(shard), "--total-shards", strconv.Itoa(totalShards),
 			"--n", "1000"} // Request all items.
 
 		output := captureStdout(t, func() {
 			claimCmd()
 		})
 
-		lines := strings.Split(strings.TrimSpace(output), "\n")
-		for _, line := range lines {
+		for line := range strings.SplitSeq(strings.TrimSpace(output), "\n") {
 			trimmed := strings.TrimSpace(line)
 			if trimmed != "" {
 				allResults[trimmed] = true
@@ -632,32 +602,31 @@ func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 		os.Args = oldArgs
 	}
 
-	// Verify all files were returned across shards
+	// Verify all files were returned across shards.
 	if len(allResults) != numFiles {
 		t.Fatalf("got %d unique results across all shards, want %d", len(allResults), numFiles)
 	}
 
-	// Verify each shard got some items (probabilistic, but should be true for 100 files)
-	for i := 0; i < totalShards; i++ {
+	// Verify each shard got some items (probabilistic, but should be true for 100 files).
+	for i := range totalShards {
 		if shardCounts[i] == 0 {
 			t.Fatalf("shard %d returned 0 items", i)
 		}
 	}
 
-	// Verify no overlap between shards by checking each file appears in exactly one shard
+	// Verify no overlap between shards by checking each file appears in exactly one shard.
 	fileToShard := make(map[string]int)
-	for shard := 0; shard < totalShards; shard++ {
+	for shard := range totalShards {
 		oldArgs := os.Args
 		os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
-			"--shard", fmt.Sprintf("%d", shard), "--total-shards", fmt.Sprintf("%d", totalShards),
+			"--shard", strconv.Itoa(shard), "--total-shards", strconv.Itoa(totalShards),
 			"--n", "1000"}
 
 		output := captureStdout(t, func() {
 			claimCmd()
 		})
 
-		lines := strings.Split(strings.TrimSpace(output), "\n")
-		for _, line := range lines {
+		for line := range strings.SplitSeq(strings.TrimSpace(output), "\n") {
 			trimmed := strings.TrimSpace(line)
 			if trimmed != "" {
 				if prevShard, exists := fileToShard[trimmed]; exists {
@@ -669,6 +638,3 @@ func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 		os.Args = oldArgs
 	}
 }
-
-// Note: Error validation for invalid shard parameters is tested manually
-// since os.Exit makes it difficult to test programmatically

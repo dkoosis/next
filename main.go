@@ -153,9 +153,41 @@ func openDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+// writeJSON encodes v as indented JSON to stdout.
+func writeJSON(v any) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		fmt.Fprintf(os.Stderr, "json encode error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// fatal prints to stderr and exits.
+func fatal(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}
+
 // ----------------------------------------
 // enqueue
 // ----------------------------------------
+
+// upsertSQL is the UPSERT statement for enqueue. Content-change detection
+// re-activates a job by clearing done_at/result/next_at when the hash differs.
+//
+//nolint:dupword // SQL NULL repetition is intentional
+const upsertSQL = `
+	INSERT INTO queue
+	  (path, path_hash, content_hash, treatment, done_at, result, next_at)
+	VALUES (?, ?, ?, ?, NULL, NULL, NULL)
+	ON CONFLICT(path_hash, treatment) DO UPDATE SET
+	  path         = excluded.path,
+	  content_hash = excluded.content_hash,
+	  done_at      = IIF(queue.content_hash = excluded.content_hash, queue.done_at, NULL),
+	  result       = IIF(queue.content_hash = excluded.content_hash, queue.result, NULL),
+	  next_at      = IIF(queue.content_hash = excluded.content_hash, queue.next_at, NULL)
+`
 
 func enqueueCmd() {
 	fs := flag.NewFlagSet("enqueue", flag.ExitOnError)
@@ -165,34 +197,29 @@ func enqueueCmd() {
 
 	db, err := openDB(*dbPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
-		os.Exit(1)
+		fatal("db error: %v", err)
 	}
 
+	count, err := enqueueFromStdin(db, *treatment)
+	if err != nil {
+		_ = db.Close()
+		fatal("enqueue: %v", err)
+	}
+	fmt.Printf("enqueued %d paths for treatment=%s\n", count, *treatment)
+	_ = db.Close()
+}
+
+func enqueueFromStdin(db *sql.DB, treatment string) (int, error) {
 	ctx := context.Background()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		_ = db.Close()
-		fmt.Fprintf(os.Stderr, "begin tx: %v\n", err)
-		os.Exit(1)
+		return 0, fmt.Errorf("begin tx: %w", err)
 	}
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO queue
-		  (path, path_hash, content_hash, treatment, done_at, result, next_at)
-		VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-		ON CONFLICT(path_hash, treatment) DO UPDATE SET
-		  path         = excluded.path,
-		  content_hash = excluded.content_hash,
-		  done_at      = IIF(queue.content_hash = excluded.content_hash, queue.done_at, NULL),
-		  result       = IIF(queue.content_hash = excluded.content_hash, queue.result, NULL),
-		  next_at      = IIF(queue.content_hash = excluded.content_hash, queue.next_at, NULL)
-	`)
+	stmt, err := tx.PrepareContext(ctx, upsertSQL)
 	if err != nil {
 		_ = tx.Rollback()
-		_ = db.Close()
-		fmt.Fprintf(os.Stderr, "prepare: %v\n", err)
-		os.Exit(1)
+		return 0, fmt.Errorf("prepare: %w", err)
 	}
 	defer func() { _ = stmt.Close() }()
 
@@ -215,27 +242,20 @@ func enqueueCmd() {
 			continue
 		}
 
-		if _, err := stmt.ExecContext(ctx, absPath, ph, ch, *treatment); err != nil {
+		if _, err := stmt.ExecContext(ctx, absPath, ph, ch, treatment); err != nil {
 			_ = tx.Rollback()
-			_ = db.Close()
-			fmt.Fprintf(os.Stderr, "insert failed for %q: %v\n", absPath, err)
-			os.Exit(1)
+			return 0, fmt.Errorf("insert %q: %w", absPath, err)
 		}
 		count++
 	}
 	if err := scanner.Err(); err != nil {
 		_ = tx.Rollback()
-		_ = db.Close()
-		fmt.Fprintf(os.Stderr, "error reading stdin: %v\n", err)
-		os.Exit(1)
+		return 0, fmt.Errorf("reading stdin: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		_ = db.Close()
-		fmt.Fprintf(os.Stderr, "commit: %v\n", err)
-		os.Exit(1)
+		return 0, fmt.Errorf("commit: %w", err)
 	}
-	fmt.Printf("enqueued %d paths for treatment=%s\n", count, *treatment)
-	_ = db.Close()
+	return count, nil
 }
 
 // ----------------------------------------
@@ -260,52 +280,19 @@ func claimCmd() {
 	totalShards := fs.Int("total-shards", 0, "total number of shards")
 	_ = fs.Parse(os.Args[2:])
 
-	// Validate sharding parameters.
-	if (*shard >= 0 && *totalShards <= 0) || (*shard < 0 && *totalShards > 0) {
-		fmt.Fprintf(os.Stderr, "error: --shard and --total-shards must be used together\n")
-		os.Exit(1)
-	}
-	if *shard >= *totalShards {
-		fmt.Fprintf(os.Stderr, "error: --shard must be less than --total-shards\n")
-		os.Exit(1)
-	}
+	validateShardFlags(*shard, *totalShards)
 
 	db, err := openDB(*dbPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
-		os.Exit(1)
+		fatal("db error: %v", err)
 	}
 	defer func() { _ = db.Close() }()
 
-	ctx := context.Background()
+	query, args := buildClaimQuery(*treatment, *cursor, *n, *shard, *totalShards)
 
-	// Build query with optional sharding.
-	query := `
-		SELECT path, path_hash
-		  FROM queue
-		 WHERE treatment = ?
-		   AND done_at IS NULL
-		   AND path_hash > ?`
-
-	args := []any{*treatment, *cursor}
-
-	if *shard >= 0 {
-		shardStart, shardEnd := calculateShardRange(*shard, *totalShards)
-		query += `
-		   AND path_hash >= ?
-		   AND path_hash < ?`
-		args = append(args, shardStart, shardEnd)
-	}
-
-	query += `
-		 ORDER BY path_hash
-		 LIMIT ?`
-	args = append(args, *n)
-
-	rows, err := db.QueryContext(ctx, query, args...)
+	rows, err := db.QueryContext(context.Background(), query, args...)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "query error: %v\n", err)
-		os.Exit(1)
+		fatal("query error: %v", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -319,21 +306,56 @@ func claimCmd() {
 		results = append(results, ClaimResult{Path: path, PathHash: hash})
 	}
 	if err := rows.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "rows error: %v\n", err)
-		os.Exit(1)
+		fatal("rows error: %v", err)
 	}
 
-	if *jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(results)
-	} else {
-		for _, r := range results {
-			if *withHash {
-				fmt.Printf("%s\t%s\n", r.PathHash, r.Path)
-			} else {
-				fmt.Println(r.Path)
-			}
+	writeClaimResults(results, *jsonOutput, *withHash)
+}
+
+func validateShardFlags(shard, totalShards int) {
+	if (shard >= 0 && totalShards <= 0) || (shard < 0 && totalShards > 0) {
+		fatal("error: --shard and --total-shards must be used together")
+	}
+	if shard >= totalShards {
+		fatal("error: --shard must be less than --total-shards")
+	}
+}
+
+func buildClaimQuery(treatment, cursor string, n, shard, totalShards int) (string, []any) {
+	query := `
+		SELECT path, path_hash
+		  FROM queue
+		 WHERE treatment = ?
+		   AND done_at IS NULL
+		   AND path_hash > ?`
+	args := []any{treatment, cursor}
+
+	if shard >= 0 {
+		shardStart, shardEnd := calculateShardRange(shard, totalShards)
+		query += `
+		   AND path_hash >= ?
+		   AND path_hash < ?`
+		args = append(args, shardStart, shardEnd)
+	}
+
+	query += `
+		 ORDER BY path_hash
+		 LIMIT ?`
+	args = append(args, n)
+
+	return query, args
+}
+
+func writeClaimResults(results []ClaimResult, jsonOutput, withHash bool) {
+	if jsonOutput {
+		writeJSON(results)
+		return
+	}
+	for _, r := range results {
+		if withHash {
+			fmt.Printf("%s\t%s\n", r.PathHash, r.Path)
+		} else {
+			fmt.Println(r.Path)
 		}
 	}
 }
@@ -352,20 +374,17 @@ func doneCmd() {
 	_ = fs.Parse(os.Args[2:])
 
 	if *path == "" {
-		fmt.Fprintf(os.Stderr, "error: --path required\n")
-		os.Exit(1)
+		fatal("error: --path required")
 	}
 	absPath, err := filepath.Abs(*path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "path error: %v\n", err)
-		os.Exit(1)
+		fatal("path error: %v", err)
 	}
 	ph := pathHash(absPath)
 
 	db, err := openDB(*dbPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
-		os.Exit(1)
+		fatal("db error: %v", err)
 	}
 	defer func() { _ = db.Close() }()
 
@@ -386,8 +405,7 @@ func doneCmd() {
 		`, now, *result, *revisit, ph, *treatment)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "update error: %v\n", err)
-		os.Exit(1)
+		fatal("update error: %v", err)
 	}
 }
 
@@ -411,8 +429,7 @@ func statusCmd() {
 
 	db, err := openDB(*dbPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
-		os.Exit(1)
+		fatal("db error: %v", err)
 	}
 	defer func() { _ = db.Close() }()
 
@@ -438,8 +455,7 @@ WITH stats AS (
 
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "query error: %v\n", err)
-		os.Exit(1)
+		fatal("query error: %v", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -448,19 +464,17 @@ WITH stats AS (
 		var t string
 		var pending, done, sortOrder int
 		if err := rows.Scan(&t, &pending, &done, &sortOrder); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: scan error: %v\n", err)
 			continue
 		}
 		results = append(results, StatusResult{Treatment: t, Pending: pending, Done: done})
 	}
 	if err := rows.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "rows error: %v\n", err)
-		os.Exit(1)
+		fatal("rows error: %v", err)
 	}
 
 	if *jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(results)
+		writeJSON(results)
 	} else {
 		fmt.Printf("%-20s %10s %10s\n", "TREATMENT", "PENDING", "DONE")
 		for _, r := range results {
@@ -481,8 +495,7 @@ func resetCmd() {
 	_ = fs.Parse(os.Args[2:])
 
 	if *treatment == "" {
-		fmt.Fprintf(os.Stderr, "error: --treatment required\n")
-		os.Exit(1)
+		fatal("error: --treatment required")
 	}
 	if !*confirm {
 		fmt.Printf("Delete all entries for treatment=%s? [y/N] ", *treatment)
@@ -496,16 +509,14 @@ func resetCmd() {
 
 	db, err := openDB(*dbPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
-		os.Exit(1)
+		fatal("db error: %v", err)
 	}
 	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 	res, err := db.ExecContext(ctx, "DELETE FROM queue WHERE treatment = ?", *treatment)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "delete error: %v\n", err)
-		os.Exit(1)
+		fatal("delete error: %v", err)
 	}
 	n, _ := res.RowsAffected()
 	fmt.Printf("deleted %d entries\n", n)

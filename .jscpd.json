@@ -1,0 +1,21 @@
+{
+  "threshold": 3,
+  "minLines": 12,
+  "maxLines": 1000,
+  "minTokens": 100,
+  "maxSize": "100kb",
+  "reporters": ["console"],
+  "mode": "mild",
+  "ignoreCase": false,
+  "gitignore": true,
+  "ignore": [
+    "**/*_test.go",
+    "**/.worktrees/**",
+    "**/vendor/**",
+    ".claude/**",
+    ".snipe/**"
+  ],
+  "format": ["go", "yaml", "json", "markdown"],
+  "absolute": false,
+  "skipLocal": false
+}
