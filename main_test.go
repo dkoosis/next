@@ -967,6 +967,80 @@ func TestClaimCmd_SkipsClaimedItems_When_LeaseActive(t *testing.T) {
 	}
 }
 
+func TestClaimCmd_ReturnsRevisitItems_When_NextAtElapsed(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	targetPath := filepath.Join(tmpDir, "revisit.txt")
+	if err := os.WriteFile(targetPath, []byte("revisit"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	absTarget, _ := filepath.Abs(targetPath)
+	ph := pathHash(absTarget)
+
+	// Insert a done item with next_at in the past (SQLite datetime format).
+	pastTime := time.Now().Add(-1 * time.Hour).UTC().Format("2006-01-02 15:04:05")
+	if _, err := db.Exec(`
+		INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, absTarget, ph, "hash-revisit", "lint", pastTime, "old-result", pastTime); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint", "--n", "10"}
+	defer func() { os.Args = oldArgs }()
+
+	output := captureStdout(t, func() { claimCmd() })
+	if strings.TrimSpace(output) != absTarget {
+		t.Fatalf("expected %s, got %q", absTarget, output)
+	}
+}
+
+func TestClaimCmd_SkipsRevisitItems_When_NextAtInFuture(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	targetPath := filepath.Join(tmpDir, "future.txt")
+	if err := os.WriteFile(targetPath, []byte("future"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	absTarget, _ := filepath.Abs(targetPath)
+	ph := pathHash(absTarget)
+
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	futureTime := time.Now().Add(24 * time.Hour).UTC().Format("2006-01-02 15:04:05")
+	if _, err := db.Exec(`
+		INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, absTarget, ph, "hash-future", "lint", now, "result", futureTime); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint", "--n", "10"}
+	defer func() { os.Args = oldArgs }()
+
+	output := captureStdout(t, func() { claimCmd() })
+	if strings.TrimSpace(output) != "" {
+		t.Fatalf("expected no output for future revisit, got %q", output)
+	}
+}
+
 func TestOpenDB_HasClaimColumns_When_SchemaApplied(t *testing.T) {
 	tmpDir := setupWorkDir(t, true)
 	dbPath := filepath.Join(tmpDir, "ledger.db")

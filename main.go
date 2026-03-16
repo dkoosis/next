@@ -323,7 +323,7 @@ func validLease(s string) bool {
 	for _, suffix := range []string{"seconds", "minutes", "hours", "days"} {
 		prefix := strings.TrimSuffix(s, " "+suffix)
 		if prefix != s {
-			if _, err := strconv.Atoi(prefix); err == nil {
+			if n, err := strconv.Atoi(prefix); err == nil && n > 0 {
 				return true
 			}
 		}
@@ -354,7 +354,7 @@ func claimCmd() {
 	}
 
 	// Validate --lease is a reasonable SQLite time modifier.
-	if *lease != "" && !validLease(*lease) {
+	if !validLease(*lease) {
 		fatal("error: --lease must be like '5 minutes', '1 hours', '7 days'")
 	}
 
