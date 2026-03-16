@@ -1131,3 +1131,58 @@ func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 	}
 
 }
+
+func TestValidTimeModifier_AcceptsValidModifiers(t *testing.T) {
+	t.Parallel()
+	for _, s := range []string{"5 minutes", "+14 days", "1 hours", "30 seconds", "-7 days"} {
+		if !validTimeModifier(s) {
+			t.Errorf("validTimeModifier(%q) = false, want true", s)
+		}
+	}
+}
+
+func TestValidTimeModifier_RejectsInvalidModifiers(t *testing.T) {
+	t.Parallel()
+	for _, s := range []string{"", "never", "5", "minutes", "0 days", "-0 hours", "foo bar"} {
+		if validTimeModifier(s) {
+			t.Errorf("validTimeModifier(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestValidLease_RejectsNonPositive(t *testing.T) {
+	t.Parallel()
+	if validLease("0 minutes") {
+		t.Error("validLease accepted 0 minutes")
+	}
+	if validLease("-1 minutes") {
+		t.Error("validLease accepted -1 minutes")
+	}
+}
+
+func TestMarkDone_SetsNextAt_When_RevisitValid(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ph := pathHash("/test/revisit")
+	if _, err := db.Exec(testInsertSQL, "/test/revisit", ph, "hash1", "lint"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	if err := markDone(db, ph, "lint", "result", "+14 days"); err != nil {
+		t.Fatalf("markDone: %v", err)
+	}
+
+	var nextAt sql.NullString
+	if err := db.QueryRow("SELECT next_at FROM queue WHERE path_hash = ?", ph).Scan(&nextAt); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !nextAt.Valid {
+		t.Fatal("next_at should be set for valid revisit modifier")
+	}
+}

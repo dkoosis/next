@@ -196,9 +196,13 @@ func openDB(path string) (*sql.DB, error) {
 	}
 
 	// Migrate: add claim columns if missing (idempotent).
-	// ALTER TABLE ADD COLUMN is a no-op error if column already exists.
-	_, _ = db.ExecContext(ctx, `ALTER TABLE queue ADD COLUMN claimed_at TEXT`)
-	_, _ = db.ExecContext(ctx, `ALTER TABLE queue ADD COLUMN claimed_by TEXT`)
+	for _, col := range []string{"claimed_at", "claimed_by"} {
+		_, alterErr := db.ExecContext(ctx, `ALTER TABLE queue ADD COLUMN `+col+` TEXT`)
+		if alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column") {
+			_ = db.Close()
+			return nil, fmt.Errorf("migration (add %s): %w", col, alterErr)
+		}
+	}
 
 	return db, nil
 }
@@ -318,8 +322,10 @@ type ClaimResult struct {
 	PathHash string `json:"path_hash,omitempty"`
 }
 
-// validLease returns true if s is a valid SQLite time modifier like "5 minutes".
-func validLease(s string) bool {
+// validTimeModifier returns true if s is a valid SQLite time modifier like "5 minutes" or "+14 days".
+func validTimeModifier(s string) bool {
+	s = strings.TrimPrefix(s, "+")
+	s = strings.TrimPrefix(s, "-")
 	for _, suffix := range []string{"seconds", "minutes", "hours", "days"} {
 		prefix := strings.TrimSuffix(s, " "+suffix)
 		if prefix != s {
@@ -329,6 +335,14 @@ func validLease(s string) bool {
 		}
 	}
 	return false
+}
+
+// validLease returns true if s is a valid positive SQLite time modifier like "5 minutes".
+func validLease(s string) bool {
+	if strings.HasPrefix(s, "-") {
+		return false
+	}
+	return validTimeModifier(s)
 }
 
 func claimCmd() {
@@ -344,6 +358,10 @@ func claimCmd() {
 	worker := fs.String("worker", "", "worker identifier for lease tracking")
 	lease := fs.String("lease", "5 minutes", "lease duration (SQLite modifier, e.g. '5 minutes')")
 	_ = fs.Parse(os.Args[2:])
+
+	if *n <= 0 {
+		fatal("error: --n must be a positive integer")
+	}
 
 	validateShardFlags(*shard, *totalShards)
 
@@ -460,6 +478,9 @@ func doneCmd() {
 
 	if *path == "" {
 		fatal("error: --path required")
+	}
+	if *revisit != "" && !validTimeModifier(*revisit) {
+		fatal("error: --revisit must be like '+14 days', '1 hours', '30 minutes'")
 	}
 	absPath, err := filepath.Abs(*path)
 	if err != nil {
@@ -613,6 +634,9 @@ func resetCmd() {
 	if err != nil {
 		fatal("delete error: %v", err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		fatal("rows affected: %v", err)
+	}
 	fmt.Printf("deleted %d entries\n", n)
 }
