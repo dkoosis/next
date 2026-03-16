@@ -879,6 +879,91 @@ func TestClaimCmd_SetsClaimedAt_When_ItemsClaimed(t *testing.T) {
 	}
 }
 
+func TestClaimCmd_ReturnsDisjointSets_When_CalledSequentially(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	for i := range 20 {
+		p := filepath.Join(tmpDir, fmt.Sprintf("conc-%03d.txt", i))
+		if err := os.WriteFile(p, fmt.Appendf(nil, "c-%d", i), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if _, err := db.Exec(testInsertSQL, p, pathHash(p), fmt.Sprintf("ch-%d", i), "lint"); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	allPaths := make(map[string]int)
+	for w := range 4 {
+		oldArgs := os.Args
+		os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
+			"--n", "5", "--worker", fmt.Sprintf("worker-%d", w)}
+		output := captureStdout(t, func() { claimCmd() })
+		os.Args = oldArgs
+
+		for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if prev, exists := allPaths[trimmed]; exists {
+				t.Errorf("path %s claimed by both worker %d and worker %d", trimmed, prev, w)
+			}
+			allPaths[trimmed] = w
+		}
+	}
+
+	if len(allPaths) != 20 {
+		t.Fatalf("expected 20 unique claims, got %d", len(allPaths))
+	}
+}
+
+func TestClaimCmd_SkipsClaimedItems_When_LeaseActive(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	p := filepath.Join(tmpDir, "single.txt")
+	if err := os.WriteFile(p, []byte("single"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := db.Exec(testInsertSQL, p, pathHash(p), "ch-single", "lint"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
+		"--n", "1", "--worker", "w1"}
+	out1 := captureStdout(t, func() { claimCmd() })
+	os.Args = oldArgs
+
+	if strings.TrimSpace(out1) != p {
+		t.Fatalf("first claim: expected %s, got %q", p, out1)
+	}
+
+	os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
+		"--n", "1", "--worker", "w2"}
+	out2 := captureStdout(t, func() { claimCmd() })
+	os.Args = oldArgs
+
+	if strings.TrimSpace(out2) != "" {
+		t.Fatalf("second claim: expected empty, got %q", out2)
+	}
+}
+
 func TestOpenDB_HasClaimColumns_When_SchemaApplied(t *testing.T) {
 	tmpDir := setupWorkDir(t, true)
 	dbPath := filepath.Join(tmpDir, "ledger.db")
