@@ -483,23 +483,14 @@ func markDone(db *sql.DB, pathHash, treatment, result, revisit string) error {
 	ctx := context.Background()
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	var res sql.Result
-	var err error
-	if revisit == "" {
-		res, err = db.ExecContext(ctx, `
-			UPDATE queue
-			   SET done_at = ?, result = ?, next_at = NULL,
-			       claimed_at = NULL, claimed_by = NULL
-			 WHERE path_hash = ? AND treatment = ?
-		`, now, result, pathHash, treatment)
-	} else {
-		res, err = db.ExecContext(ctx, `
-			UPDATE queue
-			   SET done_at = ?, result = ?, next_at = DATETIME('now', ?),
-			       claimed_at = NULL, claimed_by = NULL
-			 WHERE path_hash = ? AND treatment = ?
-		`, now, result, revisit, pathHash, treatment)
-	}
+	// When revisit is empty the IIF collapses to NULL; otherwise it computes the next visit time.
+	res, err := db.ExecContext(ctx, `
+		UPDATE queue
+		   SET done_at = ?, result = ?,
+		       next_at = IIF(? = '', NULL, DATETIME('now', ?)),
+		       claimed_at = NULL, claimed_by = NULL
+		 WHERE path_hash = ? AND treatment = ?
+	`, now, result, revisit, revisit, pathHash, treatment)
 	if err != nil {
 		return fmt.Errorf("update error: %w", err)
 	}
