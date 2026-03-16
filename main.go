@@ -318,6 +318,19 @@ type ClaimResult struct {
 	PathHash string `json:"path_hash,omitempty"`
 }
 
+// validLease returns true if s is a valid SQLite time modifier like "5 minutes".
+func validLease(s string) bool {
+	for _, suffix := range []string{"seconds", "minutes", "hours", "days"} {
+		prefix := strings.TrimSuffix(s, " "+suffix)
+		if prefix != s {
+			if _, err := strconv.Atoi(prefix); err == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func claimCmd() {
 	fs := flag.NewFlagSet("claim", flag.ExitOnError)
 	treatment := fs.String("treatment", "default", "treatment name")
@@ -341,20 +354,8 @@ func claimCmd() {
 	}
 
 	// Validate --lease is a reasonable SQLite time modifier.
-	if *lease != "" {
-		matched := false
-		for _, suffix := range []string{"seconds", "minutes", "hours", "days"} {
-			prefix := strings.TrimSuffix(*lease, " "+suffix)
-			if prefix != *lease {
-				if _, err := strconv.Atoi(prefix); err == nil {
-					matched = true
-					break
-				}
-			}
-		}
-		if !matched {
-			fatal("error: --lease must be like '5 minutes', '1 hours', '7 days'")
-		}
+	if *lease != "" && !validLease(*lease) {
+		fatal("error: --lease must be like '5 minutes', '1 hours', '7 days'")
 	}
 
 	db, err := openDB(*dbPath)
@@ -487,13 +488,15 @@ func markDone(db *sql.DB, pathHash, treatment, result, revisit string) error {
 	if revisit == "" {
 		res, err = db.ExecContext(ctx, `
 			UPDATE queue
-			   SET done_at = ?, result = ?, next_at = NULL
+			   SET done_at = ?, result = ?, next_at = NULL,
+			       claimed_at = NULL, claimed_by = NULL
 			 WHERE path_hash = ? AND treatment = ?
 		`, now, result, pathHash, treatment)
 	} else {
 		res, err = db.ExecContext(ctx, `
 			UPDATE queue
-			   SET done_at = ?, result = ?, next_at = DATETIME('now', ?)
+			   SET done_at = ?, result = ?, next_at = DATETIME('now', ?),
+			       claimed_at = NULL, claimed_by = NULL
 			 WHERE path_hash = ? AND treatment = ?
 		`, now, result, revisit, pathHash, treatment)
 	}

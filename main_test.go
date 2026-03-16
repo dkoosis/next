@@ -908,7 +908,7 @@ func TestClaimCmd_ReturnsDisjointSets_When_CalledSequentially(t *testing.T) {
 		output := captureStdout(t, func() { claimCmd() })
 		os.Args = oldArgs
 
-		for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		for line := range strings.SplitSeq(strings.TrimSpace(output), "\n") {
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "" {
 				continue
