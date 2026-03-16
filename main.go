@@ -118,11 +118,7 @@ func fileHash(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil && err == nil {
-			err = closeErr
-		}
-	}()
+	defer f.Close()
 	h := sha256.New()
 	if _, err = io.Copy(h, f); err != nil {
 		return "", err
@@ -359,11 +355,7 @@ func claimCmd() {
 	lease := fs.String("lease", "5 minutes", "lease duration (SQLite modifier, e.g. '5 minutes')")
 	_ = fs.Parse(os.Args[2:])
 
-	if *n <= 0 {
-		fatal("error: --n must be a positive integer")
-	}
-
-	validateShardFlags(*shard, *totalShards)
+	validateClaimFlags(*n, *shard, *totalShards)
 
 	// Default --worker to hostname:pid for debuggability.
 	if *worker == "" {
@@ -406,7 +398,10 @@ func claimCmd() {
 	writeClaimResults(results, *jsonOutput, *withHash)
 }
 
-func validateShardFlags(shard, totalShards int) {
+func validateClaimFlags(n, shard, totalShards int) {
+	if n <= 0 {
+		fatal("error: --n must be a positive integer")
+	}
 	if (shard >= 0 && totalShards <= 0) || (shard < 0 && totalShards > 0) {
 		fatal("error: --shard and --total-shards must be used together")
 	}

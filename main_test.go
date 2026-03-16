@@ -15,19 +15,10 @@ import (
 	"time"
 )
 
-func setupWorkDir(t *testing.T, withSchema bool) string {
+func setupWorkDir(t *testing.T) string {
 	t.Helper()
-
 	tmpDir := t.TempDir()
-	if withSchema {
-		qualityDir := filepath.Join(tmpDir, ".quality")
-		if err := os.MkdirAll(qualityDir, 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-	}
-
 	t.Chdir(tmpDir)
-
 	return tmpDir
 }
 
@@ -54,10 +45,8 @@ func captureStdout(t *testing.T, fn func()) string {
 		t.Fatalf("close writer: %v", err)
 	}
 	os.Stdout = oldStdout
-	if err := r.Close(); err != nil {
-		t.Fatalf("close reader: %v", err)
-	}
 	<-done
+	_ = r.Close()
 
 	return buf.String()
 }
@@ -99,7 +88,7 @@ func TestFileHash_ReturnsError_When_FileMissing(t *testing.T) {
 }
 
 func TestOpenDB_CreatesSchema_When_SchemaPresent(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -123,7 +112,7 @@ func TestOpenDB_CreatesSchema_When_SchemaPresent(t *testing.T) {
 }
 
 func TestOpenDB_ReturnsDB_When_SchemaMissing(t *testing.T) {
-	tmpDir := setupWorkDir(t, false)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -138,7 +127,7 @@ func TestOpenDB_ReturnsDB_When_SchemaMissing(t *testing.T) {
 }
 
 func TestEnqueueCmd_InsertsRows_When_InputContainsValidPaths(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 
@@ -214,7 +203,7 @@ func TestEnqueueCmd_InsertsRows_When_InputContainsValidPaths(t *testing.T) {
 }
 
 func TestClaimCmd_PrintsPendingPaths_When_CursorSpecified(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -298,7 +287,7 @@ func TestClaimCmd_PrintsPendingPaths_When_CursorSpecified(t *testing.T) {
 }
 
 func TestStatusCmd_ShowsCounts_When_FilteredByTreatment(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -368,7 +357,7 @@ func TestStatusCmd_ShowsCounts_When_FilteredByTreatment(t *testing.T) {
 }
 
 func TestResetCmd_DeletesEntries_When_Confirmed(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -434,7 +423,7 @@ func TestResetCmd_DeletesEntries_When_Confirmed(t *testing.T) {
 }
 
 func TestDoneCmd_MarksEntryDone_When_PathProvided(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -493,7 +482,7 @@ func TestDoneCmd_MarksEntryDone_When_PathProvided(t *testing.T) {
 // ----------------------------------------
 
 func TestMarkDone_ReturnsError_When_PathNotInQueue(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -514,7 +503,7 @@ func TestMarkDone_ReturnsError_When_PathNotInQueue(t *testing.T) {
 }
 
 func TestMarkDone_Succeeds_When_PathInQueue(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -608,7 +597,7 @@ func TestCalculateShardRange_ReturnsCorrectRanges_When_FourShards(t *testing.T) 
 }
 
 func TestEnqueueCmd_InsertsRow_When_InputIsDirectory(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 
@@ -678,7 +667,7 @@ func TestEnqueueCmd_InsertsRow_When_InputIsDirectory(t *testing.T) {
 }
 
 func TestEnqueueCmd_ReactivatesEntry_When_DirectoryContentChanges(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 
@@ -832,7 +821,7 @@ func TestDirHash_ReturnsStableHash_When_DirectoryEmpty(t *testing.T) {
 }
 
 func TestClaimCmd_SetsClaimedAt_When_ItemsClaimed(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -883,7 +872,7 @@ func TestClaimCmd_SetsClaimedAt_When_ItemsClaimed(t *testing.T) {
 }
 
 func TestClaimCmd_ReturnsDisjointSets_When_CalledSequentially(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -929,7 +918,7 @@ func TestClaimCmd_ReturnsDisjointSets_When_CalledSequentially(t *testing.T) {
 }
 
 func TestClaimCmd_SkipsClaimedItems_When_LeaseActive(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -968,7 +957,7 @@ func TestClaimCmd_SkipsClaimedItems_When_LeaseActive(t *testing.T) {
 }
 
 func TestClaimCmd_ReturnsRevisitItems_When_NextAtElapsed(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -1005,7 +994,7 @@ func TestClaimCmd_ReturnsRevisitItems_When_NextAtElapsed(t *testing.T) {
 }
 
 func TestClaimCmd_SkipsRevisitItems_When_NextAtInFuture(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -1042,7 +1031,7 @@ func TestClaimCmd_SkipsRevisitItems_When_NextAtInFuture(t *testing.T) {
 }
 
 func TestOpenDB_HasClaimColumns_When_SchemaApplied(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -1065,7 +1054,7 @@ func TestOpenDB_HasClaimColumns_When_SchemaApplied(t *testing.T) {
 }
 
 func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
@@ -1161,7 +1150,7 @@ func TestValidLease_RejectsNonPositive(t *testing.T) {
 }
 
 func TestMarkDone_SetsNextAt_When_RevisitValid(t *testing.T) {
-	tmpDir := setupWorkDir(t, true)
+	tmpDir := setupWorkDir(t)
 	dbPath := filepath.Join(tmpDir, "ledger.db")
 	db, err := openDB(dbPath)
 	if err != nil {
