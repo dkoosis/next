@@ -489,6 +489,62 @@ func TestDoneCmd_MarksEntryDone_When_PathProvided(t *testing.T) {
 // Sharding tests
 // ----------------------------------------
 
+func TestMarkDone_ReturnsError_When_PathNotInQueue(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Don't enqueue anything — markDone should fail.
+	ph := pathHash("/nonexistent/path")
+	err = markDone(db, ph, "lint", "some-result", "")
+	if err == nil {
+		t.Fatal("expected error for missing queue entry, got nil")
+	}
+	if !strings.Contains(err.Error(), "no matching queue entry") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMarkDone_Succeeds_When_PathInQueue(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	targetPath := filepath.Join(tmpDir, "valid.txt")
+	if err := os.WriteFile(targetPath, []byte("valid"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	absTarget, _ := filepath.Abs(targetPath)
+	ph := pathHash(absTarget)
+
+	if _, err := db.Exec(testInsertSQL, absTarget, ph, "hash-valid", "lint"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	if err := markDone(db, ph, "lint", "result-123", ""); err != nil {
+		t.Fatalf("markDone: %v", err)
+	}
+
+	// Verify done_at was set.
+	var doneAt sql.NullString
+	if err := db.QueryRow("SELECT done_at FROM queue WHERE path_hash = ?", ph).Scan(&doneAt); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !doneAt.Valid {
+		t.Fatal("done_at not set")
+	}
+}
+
 func TestCalculateShardRange_ReturnsCorrectRanges_When_TwoShards(t *testing.T) {
 	t.Parallel()
 

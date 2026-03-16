@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,6 +25,9 @@ import (
 var embeddedSchema string
 
 const defaultDBPath = ".quality/ledger.db"
+
+// ErrNoQueueEntry is returned by markDone when no row matches the given path/treatment.
+var ErrNoQueueEntry = errors.New("no matching queue entry")
 
 func main() {
 	if len(os.Args) < 2 {
@@ -388,25 +392,42 @@ func doneCmd() {
 	}
 	defer func() { _ = db.Close() }()
 
+	if err := markDone(db, ph, *treatment, *result, *revisit); err != nil {
+		fatal("%v", err)
+	}
+}
+
+// markDone marks a queue entry as complete. Returns an error if no matching row exists.
+func markDone(db *sql.DB, pathHash, treatment, result, revisit string) error {
 	ctx := context.Background()
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	if *revisit == "" {
-		_, err = db.ExecContext(ctx, `
+	var res sql.Result
+	var err error
+	if revisit == "" {
+		res, err = db.ExecContext(ctx, `
 			UPDATE queue
 			   SET done_at = ?, result = ?, next_at = NULL
 			 WHERE path_hash = ? AND treatment = ?
-		`, now, *result, ph, *treatment)
+		`, now, result, pathHash, treatment)
 	} else {
-		_, err = db.ExecContext(ctx, `
+		res, err = db.ExecContext(ctx, `
 			UPDATE queue
 			   SET done_at = ?, result = ?, next_at = DATETIME('now', ?)
 			 WHERE path_hash = ? AND treatment = ?
-		`, now, *result, *revisit, ph, *treatment)
+		`, now, result, revisit, pathHash, treatment)
 	}
 	if err != nil {
-		fatal("update error: %v", err)
+		return fmt.Errorf("update error: %w", err)
 	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("path_hash=%s treatment=%s: %w", pathHash, treatment, ErrNoQueueEntry)
+	}
+	return nil
 }
 
 // ----------------------------------------
