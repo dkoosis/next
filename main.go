@@ -144,7 +144,7 @@ func contentHash(path string) (string, error) {
 
 // dirHash computes a content hash for a directory by hashing the sorted
 // list of (filename, content-hash) pairs for immediate regular files only.
-// Subdirectories and symlinks are skipped (see design note at top of plan).
+// Subdirectories and symlinks are skipped — this targets Go package-level granularity.
 // Note: all empty directories produce the same hash (SHA256 of empty input);
 // this is acceptable because path_hash is the primary key discriminator.
 func dirHash(path string) (string, error) {
