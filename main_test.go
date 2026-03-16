@@ -604,6 +604,101 @@ func TestCalculateShardRange_ReturnsCorrectRanges_When_FourShards(t *testing.T) 
 	}
 }
 
+func TestDirHash_ReturnsStableHash_When_DirectoryExists(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	for _, name := range []string{"a.go", "b.go", "c.txt"} {
+		if err := os.WriteFile(filepath.Join(tmpDir, name), []byte("content-"+name), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	h1, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash: %v", err)
+	}
+	if len(h1) != 64 {
+		t.Fatalf("hash length = %d, want 64", len(h1))
+	}
+
+	h2, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash second call: %v", err)
+	}
+	if h1 != h2 {
+		t.Fatalf("dirHash not stable: %s != %s", h1, h2)
+	}
+}
+
+func TestDirHash_ChangesHash_When_FileAdded(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "a.go"), []byte("a"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	h1, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash before: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "b.go"), []byte("b"), 0o600); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+
+	h2, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash after: %v", err)
+	}
+
+	if h1 == h2 {
+		t.Fatal("dirHash should change when file added")
+	}
+}
+
+func TestDirHash_ChangesHash_When_FileModified(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	fpath := filepath.Join(tmpDir, "a.go")
+	if err := os.WriteFile(fpath, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	h1, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash before: %v", err)
+	}
+
+	if err := os.WriteFile(fpath, []byte("modified"), 0o600); err != nil {
+		t.Fatalf("write modified: %v", err)
+	}
+
+	h2, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash after: %v", err)
+	}
+
+	if h1 == h2 {
+		t.Fatal("dirHash should change when file modified")
+	}
+}
+
+func TestDirHash_ReturnsStableHash_When_DirectoryEmpty(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	h, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash empty dir: %v", err)
+	}
+	if len(h) != 64 {
+		t.Fatalf("hash length = %d, want 64", len(h))
+	}
+}
+
 func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 	tmpDir := setupWorkDir(t, true)
 

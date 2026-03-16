@@ -129,6 +129,32 @@ func fileHash(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// dirHash computes a content hash for a directory by hashing the sorted
+// list of (filename, content-hash) pairs for immediate regular files only.
+// Subdirectories and symlinks are skipped (see design note at top of plan).
+// Note: all empty directories produce the same hash (SHA256 of empty input);
+// this is acceptable because path_hash is the primary key discriminator.
+func dirHash(path string) (string, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return "", err
+	}
+
+	h := sha256.New()
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		fh, err := fileHash(filepath.Join(path, entry.Name()))
+		if err != nil {
+			return "", fmt.Errorf("hash %s: %w", entry.Name(), err)
+		}
+		// Write "name\0hash\n" for each file — sorted by os.ReadDir guarantee.
+		fmt.Fprintf(h, "%s\x00%s\n", entry.Name(), fh)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // ----------------------------------------
 // DB
 // ----------------------------------------
