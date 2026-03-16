@@ -16,6 +16,7 @@ case "$ARCH" in
     exit 1
     ;;
 esac
+PREBUILT_DIR="$REPO_DIR/.bin/linux-$ARCH"
 INSTALL_DIR="/usr/local/bin"
 
 # shellcheck source=lib-doctor.sh
@@ -47,6 +48,7 @@ finish() {
 echo "=== next sandbox setup ==="
 echo "  arch: $ARCH"
 echo "  repo: $REPO_DIR"
+echo "  prebuilt dir: $PREBUILT_DIR"
 
 # --- 1. System aliases ---
 step "1. System aliases"
@@ -57,29 +59,33 @@ else
   echo "  nothing to do"
 fi
 
-# --- 2. Node tools ---
-step "2. Node tools (jscpd)"
+# --- 2. Prebuilt binaries ---
+step "2. Prebuilt binaries"
+# Only tools NOT in codex-universal image. jq, rg, fd come from apt.
+# golangci-lint: image has v2.1.6, we override to v2.11.3.
+# Zero go install calls — everything is cross-compiled and checked in.
+if [ -d "$PREBUILT_DIR" ]; then
+  echo "  copying from $PREBUILT_DIR ..."
+  for tool in "$PREBUILT_DIR"/*; do
+    [ -f "$tool" ] || continue
+    toolname=$(basename "$tool")
+    size=$(du -h "$tool" | cut -f1)
+    cp "$tool" "$INSTALL_DIR/$toolname"
+    chmod +x "$INSTALL_DIR/$toolname"
+    echo "  installed $toolname ($size)"
+  done
+else
+  echo "  WARNING: prebuilt dir not found"
+fi
+
+# --- 3. Node tools ---
+step "3. Node tools (jscpd)"
 if have npm; then
   echo "  npm install -g jscpd@4 ..."
   npm install -g jscpd@4 --silent 2>&1 | tail -3 && echo "  installed jscpd" || warn "optional tool jscpd failed to install"
 else
   echo "  npm not found, skipping"
 fi
-
-# --- 3. Go tools (install from source if missing) ---
-step "3. Go tools"
-for gotool in "golang.org/x/vuln/cmd/govulncheck@latest:govulncheck" \
-              "mvdan.cc/gofumpt@latest:gofumpt" \
-              "golang.org/x/tools/cmd/goimports@latest:goimports"; do
-  pkg="${gotool%%:*}"
-  name="${gotool##*:}"
-  if have "$name"; then
-    echo "  $name already installed"
-  else
-    echo "  installing $name ..."
-    go install "$pkg" 2>&1 | tail -3 && echo "  installed $name" || warn "optional tool $name failed to install"
-  fi
-done
 
 # --- 4. Snipe index (conditional) ---
 step "4. Snipe index"
@@ -125,12 +131,15 @@ if have golangci-lint; then
     LINT_NUM=$(version_to_int "$LINT_GO_VER")
     ACTUAL_NUM=$(version_to_int "$ACTUAL_GO_VER")
     if [ "$LINT_NUM" -lt "$ACTUAL_NUM" ]; then
-      warn "golangci-lint built with go$LINT_GO_VER; sandbox has go$ACTUAL_GO_VER — may need rebuild"
+      warn "golangci-lint built with go$LINT_GO_VER; sandbox has go$ACTUAL_GO_VER — rebuild prebuilt with newer Go"
     fi
   fi
 fi
 
-echo "  6c. Required tools"
+echo "  6c. Restore missing prebuilt tools"
+restore_prebuilt_tools
+
+echo "  6d. Required tools"
 for tool in "${REQUIRED_TOOLS[@]}"; do
   if have "$tool"; then
     printf "  ok  %s\n" "$tool"
@@ -140,7 +149,7 @@ for tool in "${REQUIRED_TOOLS[@]}"; do
   fi
 done
 
-echo "  6d. Optional tools"
+echo "  6e. Optional tools"
 for tool in "${OPTIONAL_TOOLS[@]}"; do
   if have "$tool"; then
     printf "  ok  %s (optional)\n" "$tool"

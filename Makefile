@@ -1,4 +1,4 @@
-.PHONY: test test-race lint vet qa fast changed doctor install clean all dupl vuln snipe-index
+.PHONY: test test-race lint vet qa fast changed doctor install clean all dupl vuln snipe-index cross amd64-sandbox arm64-sandbox
 
 # Everything: QA + install
 all: qa install
@@ -55,6 +55,103 @@ install:
 clean:
 	rm -f next
 	rm -rf .quality/
+
+# ── Sandbox prebuilt versions ──
+GOLANGCI_LINT_VER ?= v2.11.3
+GOVULNCHECK_VER   ?= v1.1.4
+GOFUMPT_VER       ?= v0.9.2
+GOIMPORTS_VER     ?= v0.39.0
+MAGE_VER          ?= v1.15.0
+BAT_VER           ?= v0.25.0
+SNIPE_SRC         ?= $(HOME)/Projects/snipe
+GOMOD_VER         := $(shell awk '/^go /{print $$2}' go.mod)
+
+# ── Sandbox prebuilt cross-compilation ──
+# Mutually exclusive: building one arch deletes the other.
+# Default (cross) builds amd64 — the Codex sandbox architecture.
+cross: amd64-sandbox
+
+amd64-sandbox:
+	@echo "=== sandbox: linux/amd64 ==="
+	@rm -rf .bin/linux-arm64
+	@$(MAKE) --no-print-directory _sandbox-build SANDBOX_ARCH=amd64
+
+arm64-sandbox:
+	@echo "=== sandbox: linux/arm64 ==="
+	@rm -rf .bin/linux-amd64
+	@$(MAKE) --no-print-directory _sandbox-build SANDBOX_ARCH=arm64
+
+_sandbox-build:
+	@# Pre-flight: local Go must be >= go.mod target
+	@LOCAL_GO=$$(go version | sed 's/.*go\([0-9]*\.[0-9]*\).*/\1/'); \
+	MOD_MIN=$$(echo $(GOMOD_VER) | cut -d. -f1)$$(printf '%03d' $$(echo $(GOMOD_VER) | cut -d. -f2)); \
+	LOC_MIN=$$(echo $$LOCAL_GO | cut -d. -f1)$$(printf '%03d' $$(echo $$LOCAL_GO | cut -d. -f2)); \
+	if [ "$$LOC_MIN" -lt "$$MOD_MIN" ]; then \
+		echo "FATAL: local go$$LOCAL_GO < go.mod go$(GOMOD_VER) — prebuilts would cause sandbox lint failures"; \
+		echo "  Install Go >= $(GOMOD_VER) before running make cross"; \
+		exit 1; \
+	fi; \
+	echo "  local go$$LOCAL_GO >= go.mod go$(GOMOD_VER) — ok"
+	@mkdir -p .bin/linux-$(SANDBOX_ARCH)
+	$(eval XBIN := $(shell go env GOPATH)/bin/linux_$(SANDBOX_ARCH))
+	@echo "-- next"
+	@CGO_ENABLED=0 GOOS=linux GOARCH=$(SANDBOX_ARCH) go build -trimpath -ldflags='-s -w' -o .bin/linux-$(SANDBOX_ARCH)/next .
+	@echo "-- golangci-lint $(GOLANGCI_LINT_VER)"
+	@CGO_ENABLED=0 GOOS=linux GOARCH=$(SANDBOX_ARCH) go install -trimpath -ldflags='-s -w' github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VER)
+	@cp $(XBIN)/golangci-lint .bin/linux-$(SANDBOX_ARCH)/
+	@echo "-- govulncheck $(GOVULNCHECK_VER)"
+	@CGO_ENABLED=0 GOOS=linux GOARCH=$(SANDBOX_ARCH) go install -trimpath -ldflags='-s -w' golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VER)
+	@cp $(XBIN)/govulncheck .bin/linux-$(SANDBOX_ARCH)/
+	@echo "-- gofumpt $(GOFUMPT_VER)"
+	@CGO_ENABLED=0 GOOS=linux GOARCH=$(SANDBOX_ARCH) go install -trimpath -ldflags='-s -w' mvdan.cc/gofumpt@$(GOFUMPT_VER)
+	@cp $(XBIN)/gofumpt .bin/linux-$(SANDBOX_ARCH)/
+	@echo "-- goimports $(GOIMPORTS_VER)"
+	@CGO_ENABLED=0 GOOS=linux GOARCH=$(SANDBOX_ARCH) go install -trimpath -ldflags='-s -w' golang.org/x/tools/cmd/goimports@$(GOIMPORTS_VER)
+	@cp $(XBIN)/goimports .bin/linux-$(SANDBOX_ARCH)/
+	@echo "-- snipe"
+	@if [ -d "$(SNIPE_SRC)" ]; then \
+		echo "  (from $(SNIPE_SRC))"; \
+		cd "$(SNIPE_SRC)" && CGO_ENABLED=0 GOOS=linux GOARCH=$(SANDBOX_ARCH) \
+			go build -trimpath -ldflags='-s -w' -o "$(CURDIR)/.bin/linux-$(SANDBOX_ARCH)/snipe" .; \
+	else \
+		CGO_ENABLED=0 GOOS=linux GOARCH=$(SANDBOX_ARCH) go install -trimpath -ldflags='-s -w' github.com/dkoosis/snipe@latest && \
+			cp $(XBIN)/snipe .bin/linux-$(SANDBOX_ARCH)/; \
+	fi
+	@echo "-- bat $(BAT_VER)"
+	@if [ -f ".bin/linux-$(SANDBOX_ARCH)/bat" ]; then \
+		echo "  (exists, skipping download)"; \
+	else \
+		case "$(SANDBOX_ARCH)" in \
+			amd64) BAT_TRIPLE="x86_64-unknown-linux-musl" ;; \
+			arm64) BAT_TRIPLE="aarch64-unknown-linux-gnu" ;; \
+		esac; \
+		TMP=$$(mktemp -d); \
+		echo "  downloading bat-$(BAT_VER)-$$BAT_TRIPLE"; \
+		curl -fsSL "https://github.com/sharkdp/bat/releases/download/$(BAT_VER)/bat-$(BAT_VER)-$$BAT_TRIPLE.tar.gz" \
+			| tar xz -C "$$TMP" && \
+		cp "$$TMP"/bat-*/bat .bin/linux-$(SANDBOX_ARCH)/bat && \
+		rm -rf "$$TMP"; \
+	fi
+	@# UPX compress all ELF binaries (skip scripts)
+	@if command -v upx >/dev/null 2>&1; then \
+		echo "-- upx compressing"; \
+		for f in .bin/linux-$(SANDBOX_ARCH)/*; do \
+			[ -f "$$f" ] || continue; \
+			case "$$f" in *.upx) continue ;; esac; \
+			file "$$f" | grep -q ELF && { \
+				BEFORE=$$(du -h "$$f" | cut -f1); \
+				upx -q --best --no-backup "$$f" >/dev/null 2>&1 && \
+				AFTER=$$(du -h "$$f" | cut -f1); \
+				echo "  $$(basename $$f): $$BEFORE -> $$AFTER"; \
+			} || true; \
+		done; \
+		rm -f .bin/linux-$(SANDBOX_ARCH)/*.upx; \
+	else \
+		echo "-- upx not found, skipping (brew install upx)"; \
+	fi
+	@echo "-- result:"
+	@du -sh .bin/linux-$(SANDBOX_ARCH)/
+	@du -h .bin/linux-$(SANDBOX_ARCH)/* | sort -rh
 
 # Freshen snipe index if stale
 snipe-index:

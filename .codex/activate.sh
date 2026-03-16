@@ -6,7 +6,7 @@
 # NOTE: For Codex cloud, .codex/setup.sh runs automatically on container creation.
 # This file is for local use and as a fallback when the agent sources it via AGENTS.md.
 
-# Detect platform
+# Detect platform for prebuilt binaries
 _CODEX_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 _CODEX_ARCH=$(uname -m)
 case "$_CODEX_ARCH" in
@@ -36,8 +36,21 @@ if command -v fdfind >/dev/null 2>&1 && ! command -v fd >/dev/null 2>&1; then
   ln -sf "$(command -v fdfind)" "$PWD/bin/fd" 2>/dev/null || true
 fi
 
+# Link prebuilt binaries for current platform
+_PREBUILT_DIR="$PWD/.bin/$_CODEX_PLATFORM"
+if [ -d "$_PREBUILT_DIR" ] && [ -n "$(ls -A "$_PREBUILT_DIR" 2>/dev/null)" ]; then
+  mkdir -p "$PWD/bin" 2>/dev/null || true
+  for tool in "$_PREBUILT_DIR"/*; do
+    [ -f "$tool" ] || continue
+    toolname=$(basename "$tool")
+    if [ ! -e "$PWD/bin/$toolname" ]; then
+      ln -sf "$tool" "$PWD/bin/$toolname" 2>/dev/null || true
+    fi
+  done
+fi
+
 # PATH: repo bins first
-export PATH="$PWD/bin:$PATH"
+export PATH="$PWD/bin:$PWD/.bin:$PATH"
 
 # Helper: available commands
 codex-help() {
@@ -78,4 +91,4 @@ if [ "$_TOOLS_MISS" -gt 0 ]; then
 fi
 echo "  Run 'codex-help' for available commands"
 
-unset _CODEX_OS _CODEX_ARCH _CODEX_PLATFORM _TOOLS_OK _TOOLS_MISS _CODEX_PROJECT _t
+unset _CODEX_OS _CODEX_ARCH _CODEX_PLATFORM _PREBUILT_DIR _TOOLS_OK _TOOLS_MISS _CODEX_PROJECT _t
