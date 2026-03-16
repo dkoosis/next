@@ -286,6 +286,9 @@ func TestClaimCmd_PrintsPendingPaths_When_CursorSpecified(t *testing.T) {
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d (%q)", len(results), results)
 	}
+	// UPDATE...RETURNING does not guarantee order, so sort both slices.
+	sort.Strings(results)
+	sort.Strings(expected)
 	if results[0] != expected[0] {
 		t.Fatalf("first result = %s, want %s", results[0], expected[0])
 	}
@@ -489,6 +492,62 @@ func TestDoneCmd_MarksEntryDone_When_PathProvided(t *testing.T) {
 // Sharding tests
 // ----------------------------------------
 
+func TestMarkDone_ReturnsError_When_PathNotInQueue(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Don't enqueue anything — markDone should fail.
+	ph := pathHash("/nonexistent/path")
+	err = markDone(db, ph, "lint", "some-result", "")
+	if err == nil {
+		t.Fatal("expected error for missing queue entry, got nil")
+	}
+	if !strings.Contains(err.Error(), "no matching queue entry") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMarkDone_Succeeds_When_PathInQueue(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	targetPath := filepath.Join(tmpDir, "valid.txt")
+	if err := os.WriteFile(targetPath, []byte("valid"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	absTarget, _ := filepath.Abs(targetPath)
+	ph := pathHash(absTarget)
+
+	if _, err := db.Exec(testInsertSQL, absTarget, ph, "hash-valid", "lint"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	if err := markDone(db, ph, "lint", "result-123", ""); err != nil {
+		t.Fatalf("markDone: %v", err)
+	}
+
+	// Verify done_at was set.
+	var doneAt sql.NullString
+	if err := db.QueryRow("SELECT done_at FROM queue WHERE path_hash = ?", ph).Scan(&doneAt); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !doneAt.Valid {
+		t.Fatal("done_at not set")
+	}
+}
+
 func TestCalculateShardRange_ReturnsCorrectRanges_When_TwoShards(t *testing.T) {
 	t.Parallel()
 
@@ -545,6 +604,463 @@ func TestCalculateShardRange_ReturnsCorrectRanges_When_FourShards(t *testing.T) 
 	// Verify last shard ends at max.
 	if ranges[3][1] != "ffffffffffffffff000000000000000000000000000000000000000000000000" {
 		t.Fatalf("last shard doesn't end at max: %s", ranges[3][1])
+	}
+}
+
+func TestEnqueueCmd_InsertsRow_When_InputIsDirectory(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+
+	pkgDir := filepath.Join(tmpDir, "mypkg")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "a.go"), []byte("package mypkg"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "b.go"), []byte("package mypkg\nfunc B(){}"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	absPkg, _ := filepath.Abs(pkgDir)
+
+	inputFile, err := os.CreateTemp(tmpDir, "input")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	defer func() { _ = inputFile.Close() }()
+	fmt.Fprintln(inputFile, pkgDir)
+	if _, err := inputFile.Seek(0, 0); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "enqueue", "--db", dbPath, "--treatment", "simplify"}
+	defer func() { os.Args = oldArgs }()
+
+	oldStdin := os.Stdin
+	os.Stdin = inputFile
+	defer func() { os.Stdin = oldStdin }()
+
+	output := captureStdout(t, func() {
+		enqueueCmd()
+	})
+
+	if !strings.Contains(output, "enqueued 1 paths") {
+		t.Fatalf("unexpected output: %q", output)
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var storedPath, storedHash string
+	err = db.QueryRowContext(context.Background(),
+		"SELECT path, content_hash FROM queue WHERE treatment = ?", "simplify").
+		Scan(&storedPath, &storedHash)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if storedPath != absPkg {
+		t.Fatalf("stored path = %s, want %s", storedPath, absPkg)
+	}
+
+	wantHash, err := dirHash(absPkg)
+	if err != nil {
+		t.Fatalf("dirHash: %v", err)
+	}
+	if storedHash != wantHash {
+		t.Fatalf("stored hash = %s, want %s", storedHash, wantHash)
+	}
+}
+
+func TestEnqueueCmd_ReactivatesEntry_When_DirectoryContentChanges(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+
+	pkgDir := filepath.Join(tmpDir, "mypkg")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "a.go"), []byte("v1"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	absPkg, _ := filepath.Abs(pkgDir)
+	ph := pathHash(absPkg)
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ch1, _ := dirHash(absPkg)
+	if _, err := db.Exec(upsertSQL, absPkg, ph, ch1, "lint"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec("UPDATE queue SET done_at = ?, result = 'ok' WHERE path_hash = ?", now, ph); err != nil {
+		t.Fatalf("mark done: %v", err)
+	}
+
+	var doneAt sql.NullString
+	if err := db.QueryRow("SELECT done_at FROM queue WHERE path_hash = ?", ph).Scan(&doneAt); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !doneAt.Valid {
+		t.Fatal("expected done_at to be set")
+	}
+
+	if err := os.WriteFile(filepath.Join(pkgDir, "b.go"), []byte("new file"), 0o600); err != nil {
+		t.Fatalf("write new file: %v", err)
+	}
+
+	ch2, _ := dirHash(absPkg)
+	if ch1 == ch2 {
+		t.Fatal("dirHash should have changed")
+	}
+	if _, err := db.Exec(upsertSQL, absPkg, ph, ch2, "lint"); err != nil {
+		t.Fatalf("re-insert: %v", err)
+	}
+
+	if err := db.QueryRow("SELECT done_at FROM queue WHERE path_hash = ?", ph).Scan(&doneAt); err != nil {
+		t.Fatalf("scan after re-enqueue: %v", err)
+	}
+	if doneAt.Valid {
+		t.Fatal("expected done_at to be NULL after content-change re-enqueue")
+	}
+}
+
+func TestDirHash_ReturnsStableHash_When_DirectoryExists(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	for _, name := range []string{"a.go", "b.go", "c.txt"} {
+		if err := os.WriteFile(filepath.Join(tmpDir, name), []byte("content-"+name), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	h1, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash: %v", err)
+	}
+	if len(h1) != 64 {
+		t.Fatalf("hash length = %d, want 64", len(h1))
+	}
+
+	h2, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash second call: %v", err)
+	}
+	if h1 != h2 {
+		t.Fatalf("dirHash not stable: %s != %s", h1, h2)
+	}
+}
+
+func TestDirHash_ChangesHash_When_FileAdded(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "a.go"), []byte("a"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	h1, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash before: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "b.go"), []byte("b"), 0o600); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+
+	h2, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash after: %v", err)
+	}
+
+	if h1 == h2 {
+		t.Fatal("dirHash should change when file added")
+	}
+}
+
+func TestDirHash_ChangesHash_When_FileModified(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	fpath := filepath.Join(tmpDir, "a.go")
+	if err := os.WriteFile(fpath, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	h1, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash before: %v", err)
+	}
+
+	if err := os.WriteFile(fpath, []byte("modified"), 0o600); err != nil {
+		t.Fatalf("write modified: %v", err)
+	}
+
+	h2, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash after: %v", err)
+	}
+
+	if h1 == h2 {
+		t.Fatal("dirHash should change when file modified")
+	}
+}
+
+func TestDirHash_ReturnsStableHash_When_DirectoryEmpty(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	h, err := dirHash(tmpDir)
+	if err != nil {
+		t.Fatalf("dirHash empty dir: %v", err)
+	}
+	if len(h) != 64 {
+		t.Fatalf("hash length = %d, want 64", len(h))
+	}
+}
+
+func TestClaimCmd_SetsClaimedAt_When_ItemsClaimed(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	targetPath := filepath.Join(tmpDir, "item.txt")
+	if err := os.WriteFile(targetPath, []byte("item"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := db.Exec(testInsertSQL, targetPath, pathHash(targetPath), "hash-item", "lint"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
+		"--n", "1", "--worker", "test-worker"}
+	defer func() { os.Args = oldArgs }()
+
+	output := captureStdout(t, func() { claimCmd() })
+
+	if strings.TrimSpace(output) != targetPath {
+		t.Fatalf("expected %s, got %q", targetPath, output)
+	}
+
+	db2, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB verify: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	var claimedAt, claimedBy sql.NullString
+	err = db2.QueryRowContext(context.Background(),
+		"SELECT claimed_at, claimed_by FROM queue WHERE path = ?", targetPath).
+		Scan(&claimedAt, &claimedBy)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !claimedAt.Valid {
+		t.Fatal("claimed_at not set after claim")
+	}
+	if !claimedBy.Valid || claimedBy.String != "test-worker" {
+		t.Fatalf("claimed_by = %v, want test-worker", claimedBy)
+	}
+}
+
+func TestClaimCmd_ReturnsDisjointSets_When_CalledSequentially(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	for i := range 20 {
+		p := filepath.Join(tmpDir, fmt.Sprintf("conc-%03d.txt", i))
+		if err := os.WriteFile(p, fmt.Appendf(nil, "c-%d", i), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if _, err := db.Exec(testInsertSQL, p, pathHash(p), fmt.Sprintf("ch-%d", i), "lint"); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	allPaths := make(map[string]int)
+	for w := range 4 {
+		oldArgs := os.Args
+		os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
+			"--n", "5", "--worker", fmt.Sprintf("worker-%d", w)}
+		output := captureStdout(t, func() { claimCmd() })
+		os.Args = oldArgs
+
+		for line := range strings.SplitSeq(strings.TrimSpace(output), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if prev, exists := allPaths[trimmed]; exists {
+				t.Errorf("path %s claimed by both worker %d and worker %d", trimmed, prev, w)
+			}
+			allPaths[trimmed] = w
+		}
+	}
+
+	if len(allPaths) != 20 {
+		t.Fatalf("expected 20 unique claims, got %d", len(allPaths))
+	}
+}
+
+func TestClaimCmd_SkipsClaimedItems_When_LeaseActive(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	p := filepath.Join(tmpDir, "single.txt")
+	if err := os.WriteFile(p, []byte("single"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := db.Exec(testInsertSQL, p, pathHash(p), "ch-single", "lint"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
+		"--n", "1", "--worker", "w1"}
+	out1 := captureStdout(t, func() { claimCmd() })
+	os.Args = oldArgs
+
+	if strings.TrimSpace(out1) != p {
+		t.Fatalf("first claim: expected %s, got %q", p, out1)
+	}
+
+	os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
+		"--n", "1", "--worker", "w2"}
+	out2 := captureStdout(t, func() { claimCmd() })
+	os.Args = oldArgs
+
+	if strings.TrimSpace(out2) != "" {
+		t.Fatalf("second claim: expected empty, got %q", out2)
+	}
+}
+
+func TestClaimCmd_ReturnsRevisitItems_When_NextAtElapsed(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	targetPath := filepath.Join(tmpDir, "revisit.txt")
+	if err := os.WriteFile(targetPath, []byte("revisit"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	absTarget, _ := filepath.Abs(targetPath)
+	ph := pathHash(absTarget)
+
+	// Insert a done item with next_at in the past (SQLite datetime format).
+	pastTime := time.Now().Add(-1 * time.Hour).UTC().Format("2006-01-02 15:04:05")
+	if _, err := db.Exec(`
+		INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, absTarget, ph, "hash-revisit", "lint", pastTime, "old-result", pastTime); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint", "--n", "10"}
+	defer func() { os.Args = oldArgs }()
+
+	output := captureStdout(t, func() { claimCmd() })
+	if strings.TrimSpace(output) != absTarget {
+		t.Fatalf("expected %s, got %q", absTarget, output)
+	}
+}
+
+func TestClaimCmd_SkipsRevisitItems_When_NextAtInFuture(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	targetPath := filepath.Join(tmpDir, "future.txt")
+	if err := os.WriteFile(targetPath, []byte("future"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	absTarget, _ := filepath.Abs(targetPath)
+	ph := pathHash(absTarget)
+
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	futureTime := time.Now().Add(24 * time.Hour).UTC().Format("2006-01-02 15:04:05")
+	if _, err := db.Exec(`
+		INSERT INTO queue (path, path_hash, content_hash, treatment, done_at, result, next_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, absTarget, ph, "hash-future", "lint", now, "result", futureTime); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint", "--n", "10"}
+	defer func() { os.Args = oldArgs }()
+
+	output := captureStdout(t, func() { claimCmd() })
+	if strings.TrimSpace(output) != "" {
+		t.Fatalf("expected no output for future revisit, got %q", output)
+	}
+}
+
+func TestOpenDB_HasClaimColumns_When_SchemaApplied(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	row := db.QueryRowContext(context.Background(),
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name='queue'")
+	var ddl string
+	if err := row.Scan(&ddl); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !strings.Contains(ddl, "claimed_at") {
+		t.Fatalf("schema missing claimed_at column: %s", ddl)
+	}
+	if !strings.Contains(ddl, "claimed_by") {
+		t.Fatalf("schema missing claimed_by column: %s", ddl)
 	}
 }
 
@@ -614,27 +1130,4 @@ func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 		}
 	}
 
-	// Verify no overlap between shards by checking each file appears in exactly one shard.
-	fileToShard := make(map[string]int)
-	for shard := range totalShards {
-		oldArgs := os.Args
-		os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
-			"--shard", strconv.Itoa(shard), "--total-shards", strconv.Itoa(totalShards),
-			"--n", "1000"}
-
-		output := captureStdout(t, func() {
-			claimCmd()
-		})
-
-		for line := range strings.SplitSeq(strings.TrimSpace(output), "\n") {
-			trimmed := strings.TrimSpace(line)
-			if trimmed != "" {
-				if prevShard, exists := fileToShard[trimmed]; exists {
-					t.Fatalf("file %s appeared in both shard %d and shard %d", trimmed, prevShard, shard)
-				}
-				fileToShard[trimmed] = shard
-			}
-		}
-		os.Args = oldArgs
-	}
 }

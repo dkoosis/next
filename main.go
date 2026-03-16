@@ -8,11 +8,13 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +26,9 @@ import (
 var embeddedSchema string
 
 const defaultDBPath = ".quality/ledger.db"
+
+// ErrNoQueueEntry is returned by markDone when no row matches the given path/treatment.
+var ErrNoQueueEntry = errors.New("no matching queue entry")
 
 func main() {
 	if len(os.Args) < 2 {
@@ -125,6 +130,45 @@ func fileHash(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// contentHash returns a SHA-256 hex digest for the given path.
+// If path is a directory, it delegates to dirHash; otherwise to fileHash.
+func contentHash(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return dirHash(path)
+	}
+	return fileHash(path)
+}
+
+// dirHash computes a content hash for a directory by hashing the sorted
+// list of (filename, content-hash) pairs for immediate regular files only.
+// Subdirectories and symlinks are skipped — this targets Go package-level granularity.
+// Note: all empty directories produce the same hash (SHA256 of empty input);
+// this is acceptable because path_hash is the primary key discriminator.
+func dirHash(path string) (string, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return "", err
+	}
+
+	h := sha256.New()
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		fh, err := fileHash(filepath.Join(path, entry.Name()))
+		if err != nil {
+			return "", fmt.Errorf("hash %s: %w", entry.Name(), err)
+		}
+		// Write "name\0hash\n" for each file — sorted by os.ReadDir guarantee.
+		fmt.Fprintf(h, "%s\x00%s\n", entry.Name(), fh)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // ----------------------------------------
 // DB
 // ----------------------------------------
@@ -150,6 +194,12 @@ func openDB(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("schema execution failed: %w", execErr)
 	}
+
+	// Migrate: add claim columns if missing (idempotent).
+	// ALTER TABLE ADD COLUMN is a no-op error if column already exists.
+	_, _ = db.ExecContext(ctx, `ALTER TABLE queue ADD COLUMN claimed_at TEXT`)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE queue ADD COLUMN claimed_by TEXT`)
+
 	return db, nil
 }
 
@@ -236,7 +286,7 @@ func enqueueFromStdin(db *sql.DB, treatment string) (int, error) {
 			continue
 		}
 		ph := pathHash(absPath)
-		ch, err := fileHash(absPath)
+		ch, err := contentHash(absPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: skipping %q: %v\n", absPath, err)
 			continue
@@ -268,6 +318,19 @@ type ClaimResult struct {
 	PathHash string `json:"path_hash,omitempty"`
 }
 
+// validLease returns true if s is a valid SQLite time modifier like "5 minutes".
+func validLease(s string) bool {
+	for _, suffix := range []string{"seconds", "minutes", "hours", "days"} {
+		prefix := strings.TrimSuffix(s, " "+suffix)
+		if prefix != s {
+			if n, err := strconv.Atoi(prefix); err == nil && n > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func claimCmd() {
 	fs := flag.NewFlagSet("claim", flag.ExitOnError)
 	treatment := fs.String("treatment", "default", "treatment name")
@@ -278,9 +341,22 @@ func claimCmd() {
 	jsonOutput := fs.Bool("json", false, "output as JSON array")
 	shard := fs.Int("shard", -1, "shard number (0-based, requires --total-shards)")
 	totalShards := fs.Int("total-shards", 0, "total number of shards")
+	worker := fs.String("worker", "", "worker identifier for lease tracking")
+	lease := fs.String("lease", "5 minutes", "lease duration (SQLite modifier, e.g. '5 minutes')")
 	_ = fs.Parse(os.Args[2:])
 
 	validateShardFlags(*shard, *totalShards)
+
+	// Default --worker to hostname:pid for debuggability.
+	if *worker == "" {
+		host, _ := os.Hostname()
+		*worker = fmt.Sprintf("%s:%d", host, os.Getpid())
+	}
+
+	// Validate --lease is a reasonable SQLite time modifier.
+	if !validLease(*lease) {
+		fatal("error: --lease must be like '5 minutes', '1 hours', '7 days'")
+	}
 
 	db, err := openDB(*dbPath)
 	if err != nil {
@@ -288,7 +364,7 @@ func claimCmd() {
 	}
 	defer func() { _ = db.Close() }()
 
-	query, args := buildClaimQuery(*treatment, *cursor, *n, *shard, *totalShards)
+	query, args := buildClaimQuery(*treatment, *cursor, *worker, *lease, *n, *shard, *totalShards)
 
 	rows, err := db.QueryContext(context.Background(), query, args...)
 	if err != nil {
@@ -321,27 +397,36 @@ func validateShardFlags(shard, totalShards int) {
 	}
 }
 
-func buildClaimQuery(treatment, cursor string, n, shard, totalShards int) (string, []any) {
-	query := `
-		SELECT path, path_hash
-		  FROM queue
+func buildClaimQuery(treatment, cursor, worker, lease string, n, shard, totalShards int) (string, []any) {
+	// Inner SELECT finds eligible rows.
+	inner := `
+		SELECT rowid FROM queue
 		 WHERE treatment = ?
-		   AND done_at IS NULL
+		   AND (done_at IS NULL OR (next_at IS NOT NULL AND next_at <= DATETIME('now')))
+		   AND (claimed_at IS NULL OR claimed_at <= DATETIME('now', '-' || ?))
 		   AND path_hash > ?`
-	args := []any{treatment, cursor}
+	args := []any{treatment, lease, cursor}
 
 	if shard >= 0 {
 		shardStart, shardEnd := calculateShardRange(shard, totalShards)
-		query += `
+		inner += `
 		   AND path_hash >= ?
 		   AND path_hash < ?`
 		args = append(args, shardStart, shardEnd)
 	}
 
-	query += `
+	inner += `
 		 ORDER BY path_hash
 		 LIMIT ?`
 	args = append(args, n)
+
+	// Outer UPDATE atomically claims those rows.
+	query := fmt.Sprintf(`
+		UPDATE queue
+		   SET claimed_at = DATETIME('now'), claimed_by = ?
+		 WHERE rowid IN (%s)
+		 RETURNING path, path_hash`, inner)
+	args = append([]any{worker}, args...)
 
 	return query, args
 }
@@ -388,25 +473,44 @@ func doneCmd() {
 	}
 	defer func() { _ = db.Close() }()
 
+	if err := markDone(db, ph, *treatment, *result, *revisit); err != nil {
+		fatal("%v", err)
+	}
+}
+
+// markDone marks a queue entry as complete. Returns an error if no matching row exists.
+func markDone(db *sql.DB, pathHash, treatment, result, revisit string) error {
 	ctx := context.Background()
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	if *revisit == "" {
-		_, err = db.ExecContext(ctx, `
+	var res sql.Result
+	var err error
+	if revisit == "" {
+		res, err = db.ExecContext(ctx, `
 			UPDATE queue
-			   SET done_at = ?, result = ?, next_at = NULL
+			   SET done_at = ?, result = ?, next_at = NULL,
+			       claimed_at = NULL, claimed_by = NULL
 			 WHERE path_hash = ? AND treatment = ?
-		`, now, *result, ph, *treatment)
+		`, now, result, pathHash, treatment)
 	} else {
-		_, err = db.ExecContext(ctx, `
+		res, err = db.ExecContext(ctx, `
 			UPDATE queue
-			   SET done_at = ?, result = ?, next_at = DATETIME('now', ?)
+			   SET done_at = ?, result = ?, next_at = DATETIME('now', ?),
+			       claimed_at = NULL, claimed_by = NULL
 			 WHERE path_hash = ? AND treatment = ?
-		`, now, *result, *revisit, ph, *treatment)
+		`, now, result, revisit, pathHash, treatment)
 	}
 	if err != nil {
-		fatal("update error: %v", err)
+		return fmt.Errorf("update error: %w", err)
 	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("path_hash=%s treatment=%s: %w", pathHash, treatment, ErrNoQueueEntry)
+	}
+	return nil
 }
 
 // ----------------------------------------
