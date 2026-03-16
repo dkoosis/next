@@ -674,6 +674,65 @@ func TestEnqueueCmd_InsertsRow_When_InputIsDirectory(t *testing.T) {
 	}
 }
 
+func TestEnqueueCmd_ReactivatesEntry_When_DirectoryContentChanges(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+
+	pkgDir := filepath.Join(tmpDir, "mypkg")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "a.go"), []byte("v1"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	absPkg, _ := filepath.Abs(pkgDir)
+	ph := pathHash(absPkg)
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ch1, _ := dirHash(absPkg)
+	if _, err := db.Exec(upsertSQL, absPkg, ph, ch1, "lint"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec("UPDATE queue SET done_at = ?, result = 'ok' WHERE path_hash = ?", now, ph); err != nil {
+		t.Fatalf("mark done: %v", err)
+	}
+
+	var doneAt sql.NullString
+	if err := db.QueryRow("SELECT done_at FROM queue WHERE path_hash = ?", ph).Scan(&doneAt); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !doneAt.Valid {
+		t.Fatal("expected done_at to be set")
+	}
+
+	if err := os.WriteFile(filepath.Join(pkgDir, "b.go"), []byte("new file"), 0o600); err != nil {
+		t.Fatalf("write new file: %v", err)
+	}
+
+	ch2, _ := dirHash(absPkg)
+	if ch1 == ch2 {
+		t.Fatal("dirHash should have changed")
+	}
+	if _, err := db.Exec(upsertSQL, absPkg, ph, ch2, "lint"); err != nil {
+		t.Fatalf("re-insert: %v", err)
+	}
+
+	if err := db.QueryRow("SELECT done_at FROM queue WHERE path_hash = ?", ph).Scan(&doneAt); err != nil {
+		t.Fatalf("scan after re-enqueue: %v", err)
+	}
+	if doneAt.Valid {
+		t.Fatal("expected done_at to be NULL after content-change re-enqueue")
+	}
+}
+
 func TestDirHash_ReturnsStableHash_When_DirectoryExists(t *testing.T) {
 	t.Parallel()
 
