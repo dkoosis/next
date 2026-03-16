@@ -286,6 +286,9 @@ func TestClaimCmd_PrintsPendingPaths_When_CursorSpecified(t *testing.T) {
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d (%q)", len(results), results)
 	}
+	// UPDATE...RETURNING does not guarantee order, so sort both slices.
+	sort.Strings(results)
+	sort.Strings(expected)
 	if results[0] != expected[0] {
 		t.Fatalf("first result = %s, want %s", results[0], expected[0])
 	}
