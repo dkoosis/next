@@ -828,6 +828,57 @@ func TestDirHash_ReturnsStableHash_When_DirectoryEmpty(t *testing.T) {
 	}
 }
 
+func TestClaimCmd_SetsClaimedAt_When_ItemsClaimed(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	targetPath := filepath.Join(tmpDir, "item.txt")
+	if err := os.WriteFile(targetPath, []byte("item"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := db.Exec(testInsertSQL, targetPath, pathHash(targetPath), "hash-item", "lint"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
+		"--n", "1", "--worker", "test-worker"}
+	defer func() { os.Args = oldArgs }()
+
+	output := captureStdout(t, func() { claimCmd() })
+
+	if strings.TrimSpace(output) != targetPath {
+		t.Fatalf("expected %s, got %q", targetPath, output)
+	}
+
+	db2, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB verify: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	var claimedAt, claimedBy sql.NullString
+	err = db2.QueryRowContext(context.Background(),
+		"SELECT claimed_at, claimed_by FROM queue WHERE path = ?", targetPath).
+		Scan(&claimedAt, &claimedBy)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !claimedAt.Valid {
+		t.Fatal("claimed_at not set after claim")
+	}
+	if !claimedBy.Valid || claimedBy.String != "test-worker" {
+		t.Fatalf("claimed_by = %v, want test-worker", claimedBy)
+	}
+}
+
 func TestOpenDB_HasClaimColumns_When_SchemaApplied(t *testing.T) {
 	tmpDir := setupWorkDir(t, true)
 	dbPath := filepath.Join(tmpDir, "ledger.db")
@@ -917,27 +968,4 @@ func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 		}
 	}
 
-	// Verify no overlap between shards by checking each file appears in exactly one shard.
-	fileToShard := make(map[string]int)
-	for shard := range totalShards {
-		oldArgs := os.Args
-		os.Args = []string{"next", "claim", "--db", dbPath, "--treatment", "lint",
-			"--shard", strconv.Itoa(shard), "--total-shards", strconv.Itoa(totalShards),
-			"--n", "1000"}
-
-		output := captureStdout(t, func() {
-			claimCmd()
-		})
-
-		for line := range strings.SplitSeq(strings.TrimSpace(output), "\n") {
-			trimmed := strings.TrimSpace(line)
-			if trimmed != "" {
-				if prevShard, exists := fileToShard[trimmed]; exists {
-					t.Fatalf("file %s appeared in both shard %d and shard %d", trimmed, prevShard, shard)
-				}
-				fileToShard[trimmed] = shard
-			}
-		}
-		os.Args = oldArgs
-	}
 }

@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -327,9 +328,34 @@ func claimCmd() {
 	jsonOutput := fs.Bool("json", false, "output as JSON array")
 	shard := fs.Int("shard", -1, "shard number (0-based, requires --total-shards)")
 	totalShards := fs.Int("total-shards", 0, "total number of shards")
+	worker := fs.String("worker", "", "worker identifier for lease tracking")
+	lease := fs.String("lease", "5 minutes", "lease duration (SQLite modifier, e.g. '5 minutes')")
 	_ = fs.Parse(os.Args[2:])
 
 	validateShardFlags(*shard, *totalShards)
+
+	// Default --worker to hostname:pid for debuggability.
+	if *worker == "" {
+		host, _ := os.Hostname()
+		*worker = fmt.Sprintf("%s:%d", host, os.Getpid())
+	}
+
+	// Validate --lease is a reasonable SQLite time modifier.
+	if *lease != "" {
+		matched := false
+		for _, suffix := range []string{"seconds", "minutes", "hours", "days"} {
+			prefix := strings.TrimSuffix(*lease, " "+suffix)
+			if prefix != *lease {
+				if _, err := strconv.Atoi(prefix); err == nil {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			fatal("error: --lease must be like '5 minutes', '1 hours', '7 days'")
+		}
+	}
 
 	db, err := openDB(*dbPath)
 	if err != nil {
@@ -337,7 +363,7 @@ func claimCmd() {
 	}
 	defer func() { _ = db.Close() }()
 
-	query, args := buildClaimQuery(*treatment, *cursor, *n, *shard, *totalShards)
+	query, args := buildClaimQuery(*treatment, *cursor, *worker, *lease, *n, *shard, *totalShards)
 
 	rows, err := db.QueryContext(context.Background(), query, args...)
 	if err != nil {
@@ -370,27 +396,36 @@ func validateShardFlags(shard, totalShards int) {
 	}
 }
 
-func buildClaimQuery(treatment, cursor string, n, shard, totalShards int) (string, []any) {
-	query := `
-		SELECT path, path_hash
-		  FROM queue
+func buildClaimQuery(treatment, cursor, worker, lease string, n, shard, totalShards int) (string, []any) {
+	// Inner SELECT finds eligible rows.
+	inner := `
+		SELECT rowid FROM queue
 		 WHERE treatment = ?
-		   AND done_at IS NULL
+		   AND (done_at IS NULL OR (next_at IS NOT NULL AND next_at <= DATETIME('now')))
+		   AND (claimed_at IS NULL OR claimed_at <= DATETIME('now', '-' || ?))
 		   AND path_hash > ?`
-	args := []any{treatment, cursor}
+	args := []any{treatment, lease, cursor}
 
 	if shard >= 0 {
 		shardStart, shardEnd := calculateShardRange(shard, totalShards)
-		query += `
+		inner += `
 		   AND path_hash >= ?
 		   AND path_hash < ?`
 		args = append(args, shardStart, shardEnd)
 	}
 
-	query += `
+	inner += `
 		 ORDER BY path_hash
 		 LIMIT ?`
 	args = append(args, n)
+
+	// Outer UPDATE atomically claims those rows.
+	query := fmt.Sprintf(`
+		UPDATE queue
+		   SET claimed_at = DATETIME('now'), claimed_by = ?
+		 WHERE rowid IN (%s)
+		 RETURNING path, path_hash`, inner)
+	args = append([]any{worker}, args...)
 
 	return query, args
 }
