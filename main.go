@@ -193,6 +193,12 @@ func openDB(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("schema execution failed: %w", execErr)
 	}
+
+	// Migrate: add claim columns if missing (idempotent).
+	// ALTER TABLE ADD COLUMN is a no-op error if column already exists.
+	_, _ = db.ExecContext(ctx, `ALTER TABLE queue ADD COLUMN claimed_at TEXT`)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE queue ADD COLUMN claimed_by TEXT`)
+
 	return db, nil
 }
 

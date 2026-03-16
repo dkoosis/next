@@ -828,6 +828,29 @@ func TestDirHash_ReturnsStableHash_When_DirectoryEmpty(t *testing.T) {
 	}
 }
 
+func TestOpenDB_HasClaimColumns_When_SchemaApplied(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	row := db.QueryRowContext(context.Background(),
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name='queue'")
+	var ddl string
+	if err := row.Scan(&ddl); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !strings.Contains(ddl, "claimed_at") {
+		t.Fatalf("schema missing claimed_at column: %s", ddl)
+	}
+	if !strings.Contains(ddl, "claimed_by") {
+		t.Fatalf("schema missing claimed_by column: %s", ddl)
+	}
+}
+
 func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 	tmpDir := setupWorkDir(t, true)
 
