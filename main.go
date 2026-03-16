@@ -129,6 +129,19 @@ func fileHash(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// contentHash returns a SHA-256 hex digest for the given path.
+// If path is a directory, it delegates to dirHash; otherwise to fileHash.
+func contentHash(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return dirHash(path)
+	}
+	return fileHash(path)
+}
+
 // dirHash computes a content hash for a directory by hashing the sorted
 // list of (filename, content-hash) pairs for immediate regular files only.
 // Subdirectories and symlinks are skipped (see design note at top of plan).
@@ -266,7 +279,7 @@ func enqueueFromStdin(db *sql.DB, treatment string) (int, error) {
 			continue
 		}
 		ph := pathHash(absPath)
-		ch, err := fileHash(absPath)
+		ch, err := contentHash(absPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: skipping %q: %v\n", absPath, err)
 			continue

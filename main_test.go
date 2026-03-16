@@ -604,6 +604,76 @@ func TestCalculateShardRange_ReturnsCorrectRanges_When_FourShards(t *testing.T) 
 	}
 }
 
+func TestEnqueueCmd_InsertsRow_When_InputIsDirectory(t *testing.T) {
+	tmpDir := setupWorkDir(t, true)
+
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+
+	pkgDir := filepath.Join(tmpDir, "mypkg")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "a.go"), []byte("package mypkg"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "b.go"), []byte("package mypkg\nfunc B(){}"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	absPkg, _ := filepath.Abs(pkgDir)
+
+	inputFile, err := os.CreateTemp(tmpDir, "input")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	defer func() { _ = inputFile.Close() }()
+	fmt.Fprintln(inputFile, pkgDir)
+	if _, err := inputFile.Seek(0, 0); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "enqueue", "--db", dbPath, "--treatment", "simplify"}
+	defer func() { os.Args = oldArgs }()
+
+	oldStdin := os.Stdin
+	os.Stdin = inputFile
+	defer func() { os.Stdin = oldStdin }()
+
+	output := captureStdout(t, func() {
+		enqueueCmd()
+	})
+
+	if !strings.Contains(output, "enqueued 1 paths") {
+		t.Fatalf("unexpected output: %q", output)
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var storedPath, storedHash string
+	err = db.QueryRowContext(context.Background(),
+		"SELECT path, content_hash FROM queue WHERE treatment = ?", "simplify").
+		Scan(&storedPath, &storedHash)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if storedPath != absPkg {
+		t.Fatalf("stored path = %s, want %s", storedPath, absPkg)
+	}
+
+	wantHash, err := dirHash(absPkg)
+	if err != nil {
+		t.Fatalf("dirHash: %v", err)
+	}
+	if storedHash != wantHash {
+		t.Fatalf("stored hash = %s, want %s", storedHash, wantHash)
+	}
+}
+
 func TestDirHash_ReturnsStableHash_When_DirectoryExists(t *testing.T) {
 	t.Parallel()
 
