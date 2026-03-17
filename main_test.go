@@ -1053,6 +1053,67 @@ func TestOpenDB_HasClaimColumns_When_SchemaApplied(t *testing.T) {
 	}
 }
 
+func TestOpenDB_MigratesOldSchema_When_ClaimColumnsMissing(t *testing.T) {
+	tmpDir := setupWorkDir(t)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+
+	// Create a DB with the old schema (no claimed_at/claimed_by columns).
+	oldDB, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("open old db: %v", err)
+	}
+	_, err = oldDB.Exec(`CREATE TABLE queue (
+		path          TEXT NOT NULL,
+		path_hash     TEXT NOT NULL,
+		content_hash  TEXT NOT NULL,
+		treatment     TEXT NOT NULL,
+		done_at       TEXT,
+		result        TEXT,
+		next_at       TEXT,
+		PRIMARY KEY (path_hash, treatment)
+	);
+	CREATE INDEX IF NOT EXISTS idx_queue_treatment_done ON queue(treatment, done_at);
+	CREATE INDEX IF NOT EXISTS idx_queue_next_at ON queue(next_at);`)
+	if err != nil {
+		t.Fatalf("create old schema: %v", err)
+	}
+	if err := oldDB.Close(); err != nil {
+		t.Fatalf("close old db: %v", err)
+	}
+
+	// openDB should migrate the old schema without error.
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB on old schema failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Verify the columns were added.
+	row := db.QueryRowContext(context.Background(),
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name='queue'")
+	var ddl string
+	if err := row.Scan(&ddl); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !strings.Contains(ddl, "claimed_at") {
+		t.Fatalf("migration did not add claimed_at: %s", ddl)
+	}
+	if !strings.Contains(ddl, "claimed_by") {
+		t.Fatalf("migration did not add claimed_by: %s", ddl)
+	}
+
+	// Verify the index was created.
+	var indexCount int
+	err = db.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_queue_claimed_at'").Scan(&indexCount)
+	if err != nil {
+		t.Fatalf("check index: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("expected idx_queue_claimed_at index, found %d", indexCount)
+	}
+}
+
 func TestClaimCmd_ReturnsShardedItems_When_ShardSpecified(t *testing.T) {
 	tmpDir := setupWorkDir(t)
 

@@ -200,6 +200,12 @@ func openDB(path string) (*sql.DB, error) {
 		}
 	}
 
+	// Index on claimed_at — created after migration so it works on upgraded DBs.
+	if _, execErr := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_queue_claimed_at ON queue(claimed_at)`); execErr != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("index creation failed: %w", execErr)
+	}
+
 	return db, nil
 }
 

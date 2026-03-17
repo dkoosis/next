@@ -12,4 +12,3 @@ CREATE TABLE IF NOT EXISTS queue (
 );
 CREATE INDEX IF NOT EXISTS idx_queue_treatment_done ON queue(treatment, done_at);
 CREATE INDEX IF NOT EXISTS idx_queue_next_at ON queue(next_at);
-CREATE INDEX IF NOT EXISTS idx_queue_claimed_at ON queue(claimed_at);
