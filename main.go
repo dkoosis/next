@@ -183,8 +183,14 @@ func openDB(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, execErr
 	}
-	_, _ = db.ExecContext(ctx, `PRAGMA busy_timeout=3000;`)
-	_, _ = db.ExecContext(ctx, `PRAGMA foreign_keys=ON;`)
+	if _, execErr := db.ExecContext(ctx, `PRAGMA busy_timeout=3000;`); execErr != nil {
+		_ = db.Close()
+		return nil, execErr
+	}
+	if _, execErr := db.ExecContext(ctx, `PRAGMA foreign_keys=ON;`); execErr != nil {
+		_ = db.Close()
+		return nil, execErr
+	}
 
 	if _, execErr := db.ExecContext(ctx, embeddedSchema); execErr != nil {
 		_ = db.Close()
@@ -388,7 +394,7 @@ func claimCmd() {
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []ClaimResult
+	results := []ClaimResult{}
 	for rows.Next() {
 		var path, hash string
 		if err := rows.Scan(&path, &hash); err != nil {
@@ -503,7 +509,7 @@ func doneCmd() {
 // markDone marks a queue entry as complete. Returns an error if no matching row exists.
 func markDone(db *sql.DB, pathHash, treatment, result, revisit string) error {
 	ctx := context.Background()
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
 
 	// When revisit is empty the IIF collapses to NULL; otherwise it computes the next visit time.
 	res, err := db.ExecContext(ctx, `
@@ -576,7 +582,7 @@ WITH stats AS (
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []StatusResult
+	results := []StatusResult{}
 	for rows.Next() {
 		var t string
 		var pending, done, sortOrder int
