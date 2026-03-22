@@ -198,17 +198,15 @@ func openDB(path string) (*sql.DB, error) {
 	}
 
 	ctx := context.Background()
-	if _, execErr := db.ExecContext(ctx, `PRAGMA journal_mode=WAL;`); execErr != nil {
-		_ = db.Close()
-		return nil, execErr
-	}
-	if _, execErr := db.ExecContext(ctx, `PRAGMA busy_timeout=3000;`); execErr != nil {
-		_ = db.Close()
-		return nil, execErr
-	}
-	if _, execErr := db.ExecContext(ctx, `PRAGMA foreign_keys=ON;`); execErr != nil {
-		_ = db.Close()
-		return nil, execErr
+	for _, pragma := range []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA busy_timeout=3000",
+		"PRAGMA foreign_keys=ON",
+	} {
+		if _, execErr := db.ExecContext(ctx, pragma); execErr != nil {
+			_ = db.Close()
+			return nil, execErr
+		}
 	}
 
 	if _, execErr := db.ExecContext(ctx, embeddedSchema); execErr != nil {
@@ -387,6 +385,12 @@ func validLease(s string) bool {
 	return validTimeModifier(s)
 }
 
+// normalizeLease strips the "+" prefix so the value is safe for
+// SQL construction like DATETIME('now', '-' || lease).
+func normalizeLease(s string) string {
+	return strings.TrimPrefix(s, "+")
+}
+
 func claimCmd() {
 	fs := flag.NewFlagSet("claim", flag.ExitOnError)
 	treatment := fs.String("treatment", "default", "treatment name")
@@ -441,7 +445,7 @@ Flags:
 	}
 	defer func() { _ = db.Close() }()
 
-	query, args := buildClaimQuery(*treatment, *cursor, *worker, *lease, *n, *shard, *totalShards)
+	query, args := buildClaimQuery(*treatment, *cursor, *worker, normalizeLease(*lease), *n, *shard, *totalShards)
 
 	rows, err := db.QueryContext(context.Background(), query, args...)
 	if err != nil {
@@ -663,7 +667,7 @@ WITH stats AS (
 	query += "GROUP BY treatment)\n" +
 		"SELECT treatment, pending, done, 0 AS sort_order FROM stats\n" +
 		"UNION ALL\n" +
-		"SELECT 'TOTAL', SUM(pending), SUM(done), 1 FROM stats\n" +
+		"SELECT 'TOTAL', COALESCE(SUM(pending), 0), COALESCE(SUM(done), 0), 1 FROM stats\n" +
 		"ORDER BY sort_order, treatment;"
 
 	rows, err := db.QueryContext(ctx, query, args...)
