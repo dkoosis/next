@@ -5,45 +5,60 @@ Deterministic, resumable job queue for file-by-file processing. Pipe-friendly, S
 ## Install
 
 ```bash
-go build -o next .
-cp next ~/bin/next
+go install github.com/dkoosis/next@latest
 ```
 
 ## Usage
 
 ```bash
-# Queue files
+# Queue files or directories
 find . -name '*.go' | next enqueue --treatment=lint
+go list -f '{{.Dir}}' ./... | next enqueue --treatment=craft
 
 # Claim next task
 next claim --treatment=lint
 
-# Mark complete
-next done --path=foo.go --result=abc123 --revisit='14 days'
+# Mark complete (optionally schedule revisit)
+next done --path=foo.go --result=abc123
+next done --path=bar.go --result=def456 --revisit='+14 days'
 
 # Check status
 next status
+next status --treatment=lint --json
 
-# Reset treatment
+# Reset treatment (destructive)
 next reset --treatment=lint --yes
 ```
 
 ## Design
 
-**Hash-ordered:** Files processed in deterministic order (sha256 of path)  
-**Cursor-based:** Resume with `--cursor=HASH` (no offset drift)  
-**Content-aware:** Re-enqueue on file change (content hash in PK)  
-**Revisit:** Schedule periodic re-checks with `--revisit`
+**Hash-ordered:** Files processed in deterministic order (SHA-256 of absolute path).
+**Cursor-based:** Resume with `--cursor=HASH` (no offset drift).
+**Content-aware:** Re-enqueue detects file changes via content hash — changed files are reactivated even if previously done.
+**Directory-aware:** Enqueue accepts directories (e.g. Go package dirs). Content hash covers all regular files in the directory.
+**Leased claims:** `claim` sets a time-limited lease (default 5 minutes). Expired leases become reclaimable, preventing stuck jobs from interrupted workers.
+**Revisit:** Schedule periodic re-checks with `--revisit='+14 days'`.
 
 ## Schema
 
 ```sql
-queue(path, path_hash, content_hash, treatment, done_at, result, next_at)
+queue(path, path_hash, content_hash, treatment, done_at, result, next_at, claimed_at, claimed_by)
 ```
 
-Queue = `done_at IS NULL`  
-Done = `done_at IS NOT NULL`  
-Due = `next_at < NOW()`
+Pending = `done_at IS NULL`
+Done = `done_at IS NOT NULL`
+Due for revisit = `next_at <= NOW()`
+Lease expired = `claimed_at <= NOW() - lease`
+
+## Resuming interrupted work
+
+Re-running `enqueue` with the same paths is always safe:
+
+- **Changed content** → `done_at` cleared, entry becomes pending again
+- **Unchanged content** → stays done (no redundant re-processing)
+- **Expired claims** → reclaimable after lease timeout (default 5 min)
+
+This makes `next` idempotent for batch workflows that may be interrupted and resumed later.
 
 ## Parallel workers
 
@@ -74,23 +89,30 @@ done
 ```
 
 Sharding benefits:
-- **No coordination needed** - each worker has a disjoint hash range
-- **Deterministic distribution** - same file always goes to same shard
-- **Simple scaling** - add workers by increasing shard count
-- **Efficient** - no database contention between shards
+- **No coordination needed** — each worker has a disjoint hash range
+- **Deterministic distribution** — same file always goes to same shard
+- **Simple scaling** — add workers by increasing shard count
+- **Efficient** — no database contention between shards
 
-### Using cursors (legacy)
+### Using leases
+
+Claims are automatically leased to prevent double-processing:
 
 ```bash
-# Worker loop
+# Worker with custom lease and identity
+next claim --treatment=lint --n=5 --worker=build-server-1 --lease='10 minutes'
+```
+
+If a worker crashes, its claimed items become reclaimable after the lease expires.
+
+### Using cursors
+
+```bash
 CURSOR=""
 while path=$(next claim --treatment=lint --cursor="$CURSOR" --n=1); do
   [ -z "$path" ] && break
-  # Process $path
   result=$(./check "$path" | shasum -a 256)
   next done --path="$path" --result="$result"
   CURSOR=$(echo -n "$path" | shasum -a 256 | awk '{print $1}')
 done
 ```
-
-Use sharding instead for true parallelism without coordination overhead.
