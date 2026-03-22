@@ -46,6 +46,8 @@ func main() {
 		statusCmd()
 	case "reset":
 		resetCmd()
+	case "help", "--help", "-h":
+		usage()
 	default:
 		usage()
 		os.Exit(1)
@@ -53,32 +55,49 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `next: deterministic job queue
+	fmt.Fprintf(os.Stderr, `next — deterministic job queue for file-by-file processing
+
+Lifecycle:
+  1. enqueue  pipe paths into the queue (stdin, one per line)
+  2. claim    atomically take N unclaimed paths (prints to stdout)
+  3.          process the claimed files externally
+  4. done     mark each path complete; optionally schedule revisit
+
+Concepts:
+  treatment    Named processing pass (e.g. "lint", "format"). Same path can
+               have independent entries per treatment.
+  path_hash    SHA-256 of absolute path. Deterministic ordering, sharding, cursoring.
+  content_hash SHA-256 of file contents. Changed content re-enqueues the entry.
+  lease        claim sets a time-limited lease. Expired leases become reclaimable.
+  revisit      done --revisit schedules the entry to reappear after a duration.
 
 Commands:
-  enqueue     Read paths from stdin, add to queue
-  claim       Claim next unclaimed path(s)
-  done        Mark path as complete
-  status      Show queue stats
-  reset       Clear treatment from queue
+  enqueue   Read paths from stdin, upsert into queue
+  claim     Atomically claim unclaimed path(s), print to stdout
+  done      Mark a path as complete (silent on success)
+  status    Show pending/done counts per treatment
+  reset     Delete all entries for a treatment (destructive)
+
+Per-command help: next <command> --help
+
+Common flags (all commands):
+  --db         Database path (default: .quality/ledger.db)
+  --treatment  Treatment name (default: "default")
+
+Machine output: claim and status support --json for structured output.
+Exit codes: 0 success, 1 error (message on stderr).
 
 Examples:
   find . -name '*.go' | next enqueue --treatment=lint
-  next claim --treatment=lint --json
-  next claim --treatment=lint --shard=0 --total-shards=4 --n=100
-  next done --path=foo.go --result=abc123 --revisit='+14 days'
+  next claim --treatment=lint --n=10 --json
+  next done --path=foo.go --result=abc123
+  next done --path=bar.go --revisit='+14 days'
   next status --json
+  next reset --treatment=lint --yes
 
-Parallel processing with sharding:
-  # Worker 1
-  while true; do
-    next claim --treatment=lint --shard=0 --total-shards=4 | xargs -I{} sh -c 'process {}'
-  done
-
-  # Worker 2
-  while true; do
-    next claim --treatment=lint --shard=1 --total-shards=4 | xargs -I{} sh -c 'process {}'
-  done
+Parallel processing (sharding divides the hash space across workers):
+  next claim --treatment=lint --shard=0 --total-shards=4 --n=100
+  next claim --treatment=lint --shard=1 --total-shards=4 --n=100
 `)
 }
 
@@ -255,6 +274,21 @@ func enqueueCmd() {
 	fs := flag.NewFlagSet("enqueue", flag.ExitOnError)
 	treatment := fs.String("treatment", "default", "treatment name")
 	dbPath := fs.String("db", defaultDBPath, "database path")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: next enqueue [--treatment=NAME] [--db=PATH]
+
+Read file paths from stdin (one per line), upsert into the queue.
+Paths are converted to absolute. Empty lines are skipped.
+If a path's content hash changed since last enqueue, it is re-enqueued (done_at cleared).
+
+Stdin:  one file path per line
+Stdout: "enqueued N paths for treatment=NAME"
+Stderr: warnings for unreadable paths (skipped, processing continues)
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
 	_ = fs.Parse(os.Args[2:])
 
 	db, err := openDB(*dbPath)
@@ -365,6 +399,27 @@ func claimCmd() {
 	totalShards := fs.Int("total-shards", 0, "total number of shards")
 	worker := fs.String("worker", "", "worker identifier for lease tracking")
 	lease := fs.String("lease", "5 minutes", "lease duration (SQLite modifier, e.g. '5 minutes')")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: next claim [--treatment=NAME] [--n=N] [--json] [flags]
+
+Atomically claim unclaimed paths and print them to stdout.
+Claims paths that are: not done OR past revisit time, AND lease expired or unclaimed.
+Ordered by path_hash for deterministic cursor-based pagination.
+
+Output (default):     one absolute path per line
+Output (--with-hash): PATH_HASH<TAB>PATH per line (use hash as --cursor for next batch)
+Output (--json):      [{"path":"...","path_hash":"..."}]
+
+Empty output (no lines / empty JSON array []) means nothing left to claim.
+
+Sharding: --shard and --total-shards partition the hash space for parallel workers.
+Cursoring: --cursor=HASH resumes after that hash (use with --with-hash output).
+Lease: claimed paths expire after --lease duration and become reclaimable.
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
 	_ = fs.Parse(os.Args[2:])
 
 	validateClaimFlags(*n, *shard, *totalShards)
@@ -394,6 +449,11 @@ func claimCmd() {
 	}
 	defer func() { _ = rows.Close() }()
 
+	results := scanClaimResults(rows)
+	writeClaimResults(results, *jsonOutput, *withHash)
+}
+
+func scanClaimResults(rows *sql.Rows) []ClaimResult {
 	results := []ClaimResult{}
 	for rows.Next() {
 		var path, hash string
@@ -406,8 +466,7 @@ func claimCmd() {
 	if err := rows.Err(); err != nil {
 		fatal("rows error: %v", err)
 	}
-
-	writeClaimResults(results, *jsonOutput, *withHash)
+	return results
 }
 
 func validateClaimFlags(n, shard, totalShards int) {
@@ -481,6 +540,23 @@ func doneCmd() {
 	revisit := fs.String("revisit", "", "revisit after duration (e.g., '+14 days')")
 	treatment := fs.String("treatment", "default", "treatment name")
 	dbPath := fs.String("db", defaultDBPath, "database path")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: next done --path=FILE [--result=HASH] [--revisit=DURATION] [flags]
+
+Mark a path as complete. Clears its lease.
+Fails with exit 1 if no matching entry exists for path + treatment.
+
+--path is required (relative paths are resolved to absolute).
+--revisit schedules re-entry after a duration: "+14 days", "1 hours", "30 minutes".
+--result stores an arbitrary string (e.g. content hash of output).
+
+Stdout: silent on success
+Stderr: error message on failure (exit 1)
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
 	_ = fs.Parse(os.Args[2:])
 
 	if *path == "" {
@@ -548,6 +624,20 @@ func statusCmd() {
 	treatment := fs.String("treatment", "", "filter by treatment (empty = all)")
 	dbPath := fs.String("db", defaultDBPath, "database path")
 	jsonOutput := fs.Bool("json", false, "output as JSON array")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: next status [--treatment=NAME] [--json] [--db=PATH]
+
+Show pending/done counts per treatment.
+
+Output (default): table with columns TREATMENT, PENDING, DONE (includes TOTAL row)
+Output (--json):  [{"treatment":"...","pending":N,"done":N}] (TOTAL row included)
+
+When --treatment is set, shows only that treatment (still includes TOTAL row).
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
 	_ = fs.Parse(os.Args[2:])
 
 	db, err := openDB(*dbPath)
@@ -615,6 +705,20 @@ func resetCmd() {
 	treatment := fs.String("treatment", "", "treatment to reset (required)")
 	dbPath := fs.String("db", defaultDBPath, "database path")
 	confirm := fs.Bool("yes", false, "skip confirmation")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: next reset --treatment=NAME [--yes] [--db=PATH]
+
+Delete ALL queue entries for the given treatment. Destructive and irreversible.
+Prompts for confirmation unless --yes is passed. Always use --yes in scripts.
+
+--treatment is required.
+
+Stdout: "deleted N entries"
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
 	_ = fs.Parse(os.Args[2:])
 
 	if *treatment == "" {
