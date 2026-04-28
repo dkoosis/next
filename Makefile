@@ -1,5 +1,9 @@
 .PHONY: test test-race lint vet qa fast changed doctor install clean all dupl vuln snipe-index cross amd64-sandbox arm64-sandbox
 
+# Strict shell for recipes: fail on first error, undefined var, or pipe failure.
+SHELL := /bin/bash
+.SHELLFLAGS := -euo pipefail -c
+
 # Everything: QA + install
 all: qa install
 	@echo "=== all pass ==="
