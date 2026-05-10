@@ -91,7 +91,6 @@ linters:
         - deprecatedComment
         - hugeParam
         - ifElseChain
-        - rangeValCopy
         - unlambda
     # Greenfield — tight from day one
     cyclop:
