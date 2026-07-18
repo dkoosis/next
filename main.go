@@ -46,6 +46,10 @@ func main() {
 		statusCmd()
 	case "reset":
 		resetCmd()
+	case "reconcile":
+		reconcileCmd()
+	case "gc":
+		gcCmd()
 	case "help", "--help", "-h":
 		usage()
 	default:
@@ -72,11 +76,13 @@ Concepts:
   revisit      done --revisit schedules the entry to reappear after a duration.
 
 Commands:
-  enqueue   Read paths from stdin, upsert into queue
-  claim     Atomically claim unclaimed path(s), print to stdout
-  done      Mark a path as complete (silent on success)
-  status    Show pending/done counts per treatment
-  reset     Delete all entries for a treatment (destructive)
+  enqueue    Read paths from stdin, upsert into queue
+  claim      Atomically claim unclaimed path(s), print to stdout
+  done       Mark a path as complete (silent on success)
+  status     Show pending/done counts per treatment
+  reset      Delete all entries for a treatment (destructive)
+  reconcile  Prune queue entries absent from a piped ground-truth unit list
+  gc         Drop treatments with no activity in --stale duration (destructive)
 
 Per-command help: next <command> --help
 
@@ -84,8 +90,12 @@ Common flags (all commands):
   --db         Database path (default: .quality/ledger.db)
   --treatment  Treatment name (default: "default")
 
-Machine output: claim and status support --json for structured output.
+Machine output: claim, status, reconcile and gc support --json for structured output.
 Exit codes: 0 success, 1 error (message on stderr).
+
+Layering: next only diffs and prunes against what it's given — it never
+resolves ground truth itself (no go list, no globs). The caller resolves
+the current unit set and pipes it in via reconcile --units=-.
 
 Examples:
   find . -name '*.go' | next enqueue --treatment=lint
@@ -94,6 +104,8 @@ Examples:
   next done --path=bar.go --revisit='+14 days'
   next status --json
   next reset --treatment=lint --yes
+  go list -f '{{.Dir}}' ./... | next reconcile --units=- --treatment=lint
+  next gc --stale='30 days' --yes
 
 Parallel processing (sharding divides the hash space across workers):
   next claim --treatment=lint --shard=0 --total-shards=4 --n=100
@@ -214,8 +226,8 @@ func openDB(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("schema execution failed: %w", execErr)
 	}
 
-	// Migrate: add claim columns if missing (idempotent).
-	for _, col := range []string{"claimed_at", "claimed_by"} {
+	// Migrate: add claim/spec/activity columns if missing (idempotent).
+	for _, col := range []string{"claimed_at", "claimed_by", "spec_hash", "updated_at"} {
 		_, alterErr := db.ExecContext(ctx, `ALTER TABLE queue ADD COLUMN `+col+` TEXT`)
 		if alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column") {
 			_ = db.Close()
@@ -223,10 +235,15 @@ func openDB(path string) (*sql.DB, error) {
 		}
 	}
 
-	// Index on claimed_at — created after migration so it works on upgraded DBs.
-	if _, execErr := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_queue_claimed_at ON queue(claimed_at)`); execErr != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("index creation failed: %w", execErr)
+	// Indexes created after migration so they work on upgraded DBs.
+	for _, idx := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_queue_claimed_at ON queue(claimed_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_queue_treatment_updated ON queue(treatment, updated_at)`,
+	} {
+		if _, execErr := db.ExecContext(ctx, idx); execErr != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("index creation failed: %w", execErr)
+		}
 	}
 
 	return db, nil
@@ -253,31 +270,54 @@ func fatal(format string, args ...any) {
 // ----------------------------------------
 
 // upsertSQL is the UPSERT statement for enqueue. Content-change detection
-// re-activates a job by clearing done_at/result/next_at when the hash differs.
+// re-activates a job by clearing done_at/result/next_at when the content
+// hash OR the op-spec hash differs from what was last recorded — a unit
+// unchanged by name but changed in content, or reprocessed under a changed
+// op spec, is not done. COALESCE(...,'') treats NULL and '' as equal so
+// pre-migration rows (spec_hash NULL) and callers that omit --spec-hash
+// (spec_hash '') compare sanely instead of always mismatching.
 //
 //nolint:dupword // SQL NULL repetition is intentional
 const upsertSQL = `
 	INSERT INTO queue
-	  (path, path_hash, content_hash, treatment, done_at, result, next_at)
-	VALUES (?, ?, ?, ?, NULL, NULL, NULL)
+	  (path, path_hash, content_hash, spec_hash, treatment, done_at, result, next_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, DATETIME('now'))
 	ON CONFLICT(path_hash, treatment) DO UPDATE SET
 	  path         = excluded.path,
 	  content_hash = excluded.content_hash,
-	  done_at      = IIF(queue.content_hash = excluded.content_hash, queue.done_at, NULL),
-	  result       = IIF(queue.content_hash = excluded.content_hash, queue.result, NULL),
-	  next_at      = IIF(queue.content_hash = excluded.content_hash, queue.next_at, NULL)
+	  spec_hash    = excluded.spec_hash,
+	  updated_at   = DATETIME('now'),
+	  done_at      = IIF(queue.content_hash = excluded.content_hash
+	                      AND COALESCE(queue.spec_hash,'') = COALESCE(excluded.spec_hash,''),
+	                      queue.done_at, NULL),
+	  result       = IIF(queue.content_hash = excluded.content_hash
+	                      AND COALESCE(queue.spec_hash,'') = COALESCE(excluded.spec_hash,''),
+	                      queue.result, NULL),
+	  next_at      = IIF(queue.content_hash = excluded.content_hash
+	                      AND COALESCE(queue.spec_hash,'') = COALESCE(excluded.spec_hash,''),
+	                      queue.next_at, NULL),
+	  claimed_at   = IIF(queue.content_hash = excluded.content_hash
+	                      AND COALESCE(queue.spec_hash,'') = COALESCE(excluded.spec_hash,''),
+	                      queue.claimed_at, NULL),
+	  claimed_by   = IIF(queue.content_hash = excluded.content_hash
+	                      AND COALESCE(queue.spec_hash,'') = COALESCE(excluded.spec_hash,''),
+	                      queue.claimed_by, NULL)
 `
 
 func enqueueCmd() {
 	fs := flag.NewFlagSet("enqueue", flag.ExitOnError)
 	treatment := fs.String("treatment", "default", "treatment name")
 	dbPath := fs.String("db", defaultDBPath, "database path")
+	specHash := fs.String("spec-hash", "", "op-spec hash; changing it reopens done units even if content is unchanged")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, `Usage: next enqueue [--treatment=NAME] [--db=PATH]
+		fmt.Fprintf(os.Stderr, `Usage: next enqueue [--treatment=NAME] [--spec-hash=HASH] [--db=PATH]
 
 Read file paths from stdin (one per line), upsert into the queue.
 Paths are converted to absolute. Empty lines are skipped.
-If a path's content hash changed since last enqueue, it is re-enqueued (done_at cleared).
+Done-state is keyed on content_hash(path) + --spec-hash. If a path's content
+hash changed since last enqueue, OR --spec-hash differs from what was last
+recorded for it, it is re-enqueued (done_at cleared) even though its name
+is unchanged.
 
 Stdin:  one file path per line
 Stdout: "enqueued N paths for treatment=NAME"
@@ -294,7 +334,7 @@ Flags:
 		fatal("db error: %v", err)
 	}
 
-	count, err := enqueueFromStdin(db, *treatment)
+	count, err := enqueueFromStdin(db, *treatment, *specHash)
 	if err != nil {
 		_ = db.Close()
 		fatal("enqueue: %v", err)
@@ -303,7 +343,7 @@ Flags:
 	_ = db.Close()
 }
 
-func enqueueFromStdin(db *sql.DB, treatment string) (int, error) {
+func enqueueFromStdin(db *sql.DB, treatment, specHash string) (int, error) {
 	ctx := context.Background()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -336,7 +376,7 @@ func enqueueFromStdin(db *sql.DB, treatment string) (int, error) {
 			continue
 		}
 
-		if _, err := stmt.ExecContext(ctx, absPath, ph, ch, treatment); err != nil {
+		if _, err := stmt.ExecContext(ctx, absPath, ph, ch, specHash, treatment); err != nil {
 			_ = tx.Rollback()
 			return 0, fmt.Errorf("insert %q: %w", absPath, err)
 		}
@@ -511,7 +551,7 @@ func buildClaimQuery(treatment, cursor, worker, lease string, n, shard, totalSha
 	// Outer UPDATE atomically claims those rows.
 	query := fmt.Sprintf(`
 		UPDATE queue
-		   SET claimed_at = DATETIME('now'), claimed_by = ?
+		   SET claimed_at = DATETIME('now'), claimed_by = ?, updated_at = DATETIME('now')
 		 WHERE rowid IN (%s)
 		 RETURNING path, path_hash`, inner)
 	args = append([]any{worker}, args...)
@@ -596,7 +636,8 @@ func markDone(db *sql.DB, pathHash, treatment, result, revisit string) error {
 		UPDATE queue
 		   SET done_at = ?, result = ?,
 		       next_at = IIF(? = '', NULL, DATETIME('now', ?)),
-		       claimed_at = NULL, claimed_by = NULL
+		       claimed_at = NULL, claimed_by = NULL,
+		       updated_at = DATETIME('now')
 		 WHERE path_hash = ? AND treatment = ?
 	`, now, result, revisit, revisit, pathHash, treatment)
 	if err != nil {
@@ -704,6 +745,19 @@ WITH stats AS (
 // reset
 // ----------------------------------------
 
+// confirmed returns true immediately if skip is set (e.g. --yes). Otherwise
+// it prints prompt + " [y/N] ", reads one line from stdin, and returns
+// whether the response was y/Y.
+func confirmed(skip bool, prompt string) bool {
+	if skip {
+		return true
+	}
+	fmt.Printf("%s [y/N] ", prompt)
+	var response string
+	_, _ = fmt.Scanln(&response)
+	return response == "y" || response == "Y"
+}
+
 func resetCmd() {
 	fs := flag.NewFlagSet("reset", flag.ExitOnError)
 	treatment := fs.String("treatment", "", "treatment to reset (required)")
@@ -728,14 +782,9 @@ Flags:
 	if *treatment == "" {
 		fatal("error: --treatment required")
 	}
-	if !*confirm {
-		fmt.Printf("Delete all entries for treatment=%s? [y/N] ", *treatment)
-		var response string
-		_, _ = fmt.Scanln(&response)
-		if response != "y" && response != "Y" {
-			fmt.Println("canceled")
-			return
-		}
+	if !confirmed(*confirm, fmt.Sprintf("Delete all entries for treatment=%s?", *treatment)) {
+		fmt.Println("canceled")
+		return
 	}
 
 	db, err := openDB(*dbPath)
@@ -754,4 +803,308 @@ Flags:
 		fatal("rows affected: %v", err)
 	}
 	fmt.Printf("deleted %d entries\n", n)
+}
+
+// ----------------------------------------
+// reconcile
+// ----------------------------------------
+
+// PruneResult holds a queue entry pruned by reconcile.
+type PruneResult struct {
+	Path     string `json:"path"`
+	PathHash string `json:"path_hash"`
+}
+
+func reconcileCmd() {
+	fs := flag.NewFlagSet("reconcile", flag.ExitOnError)
+	treatment := fs.String("treatment", "default", "treatment name")
+	dbPath := fs.String("db", defaultDBPath, "database path")
+	units := fs.String("units", "-", "ground-truth unit list source; only '-' (stdin) is supported")
+	jsonOutput := fs.Bool("json", false, "output pruned entries as a JSON array")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: next reconcile --units=- [--treatment=NAME] [--db=PATH] [--json]
+
+Diff a ground-truth unit list against the queue for --treatment. Any queued
+path whose path_hash is NOT present in the piped list is pruned (deleted) —
+the "vanished units" half of zombie-data cleanup.
+
+LAYERING: next only diffs and prunes what it's given. It does not resolve
+ground truth itself (no go list, no glob walk) — the caller resolves the
+current unit set and pipes it in via --units=-.
+
+Stdin (--units=-): one path per line (absolute or relative; empty lines skipped)
+Stdout: "reconciled: N pruned, M kept for treatment=NAME" (or JSON array of
+        pruned {path, path_hash} with --json)
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+	_ = fs.Parse(os.Args[2:])
+
+	if *units != "-" {
+		fatal("error: --units only supports '-' (stdin) — next does not resolve ground truth itself")
+	}
+
+	db, err := openDB(*dbPath)
+	if err != nil {
+		fatal("db error: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	pruned, kept, err := reconcileFromStdin(db, os.Stdin, *treatment)
+	if err != nil {
+		fatal("reconcile: %v", err)
+	}
+
+	if *jsonOutput {
+		writeJSON(pruned)
+		return
+	}
+	fmt.Printf("reconciled: %d pruned, %d kept for treatment=%s\n", len(pruned), kept, *treatment)
+}
+
+// groundTruthHashes reads a newline-delimited path list from r and returns
+// the set of path_hash(absPath) it names. Unreadable lines (bad abs-path
+// resolution) are skipped with a warning, not fatal.
+func groundTruthHashes(r io.Reader) (map[string]bool, error) {
+	groundTruth := map[string]bool{}
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		absPath, err := filepath.Abs(line)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping %q: %v\n", line, err)
+			continue
+		}
+		groundTruth[pathHash(absPath)] = true
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading stdin: %w", err)
+	}
+	return groundTruth, nil
+}
+
+// reconcileFromStdin reads a newline-delimited ground-truth path list from
+// r (os.Stdin in production) and deletes any queue row for treatment whose
+// path_hash is absent from that list. Returns the pruned entries and the
+// count kept.
+func reconcileFromStdin(db *sql.DB, r io.Reader, treatment string) ([]PruneResult, int, error) {
+	ctx := context.Background()
+
+	groundTruth, err := groundTruthHashes(r)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin tx: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, "SELECT path, path_hash FROM queue WHERE treatment = ?", treatment)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, 0, fmt.Errorf("select: %w", err)
+	}
+	existing, err := scanPathRows(rows)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, 0, err
+	}
+
+	stmt, err := tx.PrepareContext(ctx, "DELETE FROM queue WHERE path_hash = ? AND treatment = ?")
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, 0, fmt.Errorf("prepare delete: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	pruned := []PruneResult{}
+	kept := 0
+	for _, e := range existing {
+		if groundTruth[e.hash] {
+			kept++
+			continue
+		}
+		if _, err := stmt.ExecContext(ctx, e.hash, treatment); err != nil {
+			_ = tx.Rollback()
+			return nil, 0, fmt.Errorf("delete %q: %w", e.path, err)
+		}
+		pruned = append(pruned, PruneResult{Path: e.path, PathHash: e.hash})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, 0, fmt.Errorf("commit: %w", err)
+	}
+	return pruned, kept, nil
+}
+
+type pathHashRow struct{ path, hash string }
+
+func scanPathRows(rows *sql.Rows) ([]pathHashRow, error) {
+	defer func() { _ = rows.Close() }()
+	var out []pathHashRow
+	for rows.Next() {
+		var r pathHashRow
+		if err := rows.Scan(&r.path, &r.hash); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows: %w", err)
+	}
+	return out, nil
+}
+
+// ----------------------------------------
+// gc
+// ----------------------------------------
+
+// GCResult holds a treatment dropped by gc, and how many entries it held.
+type GCResult struct {
+	Treatment string `json:"treatment"`
+	Count     int    `json:"count"`
+}
+
+func gcCmd() {
+	fs := flag.NewFlagSet("gc", flag.ExitOnError)
+	dbPath := fs.String("db", defaultDBPath, "database path")
+	stale := fs.String("stale", "", "drop treatments with no activity in this duration, e.g. '30 days' (required)")
+	confirm := fs.Bool("yes", false, "skip confirmation")
+	jsonOutput := fs.Bool("json", false, "output dropped treatments as a JSON array")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: next gc --stale=DURATION [--yes] [--db=PATH] [--json]
+
+Drop (delete) ALL queue entries for every treatment with no activity
+(enqueue, claim, or done) in --stale duration. Destructive and irreversible.
+Prompts for confirmation unless --yes is passed. Always use --yes in scripts.
+
+--stale is required, e.g. '30 days', '12 hours'.
+
+Stdout: "gc: dropped treatment=NAME (N entries)" per dropped treatment
+        (or JSON array of {treatment, count} with --json)
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+	_ = fs.Parse(os.Args[2:])
+
+	if *stale == "" {
+		fatal("error: --stale required, e.g. --stale='30 days'")
+	}
+	if !validLease(*stale) {
+		fatal("error: --stale must be a positive duration like '30 days', '12 hours'")
+	}
+
+	db, err := openDB(*dbPath)
+	if err != nil {
+		fatal("db error: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	treatments, err := staleTreatments(db, normalizeLease(*stale))
+	if err != nil {
+		fatal("gc: %v", err)
+	}
+
+	if len(treatments) == 0 {
+		if *jsonOutput {
+			writeJSON([]GCResult{})
+			return
+		}
+		fmt.Println("gc: no stale treatments")
+		return
+	}
+
+	prompt := fmt.Sprintf("Drop %d stale treatment(s): %s?", len(treatments), strings.Join(treatments, ", "))
+	if !confirmed(*confirm, prompt) {
+		fmt.Println("canceled")
+		return
+	}
+
+	dropped, err := dropTreatments(db, treatments)
+	if err != nil {
+		fatal("gc: %v", err)
+	}
+
+	if *jsonOutput {
+		writeJSON(dropped)
+		return
+	}
+	for _, d := range dropped {
+		fmt.Printf("gc: dropped treatment=%s (%d entries)\n", d.Treatment, d.Count)
+	}
+}
+
+// staleTreatments returns treatment names whose most recent activity
+// (updated_at, bumped by enqueue/claim/done) is older than the given
+// SQLite duration modifier (e.g. "30 days"). Pre-migration rows with a
+// NULL updated_at are treated as maximally stale.
+func staleTreatments(db *sql.DB, staleModifier string) ([]string, error) {
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT treatment
+		  FROM queue
+		 GROUP BY treatment
+		HAVING MAX(COALESCE(updated_at, '1970-01-01 00:00:00')) <= DATETIME('now', '-' || ?)
+	`, staleModifier)
+	if err != nil {
+		return nil, fmt.Errorf("query stale treatments: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows: %w", err)
+	}
+	return out, nil
+}
+
+// dropTreatments deletes every queue entry for each given treatment,
+// returning the count dropped per treatment.
+func dropTreatments(db *sql.DB, treatments []string) ([]GCResult, error) {
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+
+	stmt, err := tx.PrepareContext(ctx, "DELETE FROM queue WHERE treatment = ?")
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("prepare: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	results := make([]GCResult, 0, len(treatments))
+	for _, t := range treatments {
+		res, err := stmt.ExecContext(ctx, t)
+		if err != nil {
+			_ = tx.Rollback()
+			return nil, fmt.Errorf("delete %q: %w", t, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			return nil, fmt.Errorf("rows affected %q: %w", t, err)
+		}
+		results = append(results, GCResult{Treatment: t, Count: int(n)})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return results, nil
 }

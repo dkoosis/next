@@ -688,7 +688,7 @@ func TestEnqueueCmd_ReactivatesEntry_When_DirectoryContentChanges(t *testing.T) 
 	defer func() { _ = db.Close() }()
 
 	ch1, _ := dirHash(absPkg)
-	if _, err := db.Exec(upsertSQL, absPkg, ph, ch1, "lint"); err != nil {
+	if _, err := db.Exec(upsertSQL, absPkg, ph, ch1, "", "lint"); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 
@@ -713,7 +713,7 @@ func TestEnqueueCmd_ReactivatesEntry_When_DirectoryContentChanges(t *testing.T) 
 	if ch1 == ch2 {
 		t.Fatal("dirHash should have changed")
 	}
-	if _, err := db.Exec(upsertSQL, absPkg, ph, ch2, "lint"); err != nil {
+	if _, err := db.Exec(upsertSQL, absPkg, ph, ch2, "", "lint"); err != nil {
 		t.Fatalf("re-insert: %v", err)
 	}
 
@@ -1234,5 +1234,371 @@ func TestMarkDone_SetsNextAt_When_RevisitValid(t *testing.T) {
 	}
 	if !nextAt.Valid {
 		t.Fatal("next_at should be set for valid revisit modifier")
+	}
+}
+
+// ----------------------------------------
+// content-hash + op-spec-hash done-state
+// ----------------------------------------
+
+func TestEnqueueCmd_ReactivatesEntry_When_SpecHashChanges(t *testing.T) {
+	tmpDir := setupWorkDir(t)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+
+	validFile := filepath.Join(tmpDir, "unit.go")
+	if err := os.WriteFile(validFile, []byte("package unit"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	absPath, err := filepath.Abs(validFile)
+	if err != nil {
+		t.Fatalf("abs: %v", err)
+	}
+	ph := pathHash(absPath)
+
+	runEnqueue := func(specHash string) {
+		inputFile, cerr := os.CreateTemp(tmpDir, "input")
+		if cerr != nil {
+			t.Fatalf("create temp input: %v", cerr)
+		}
+		defer func() { _ = inputFile.Close() }()
+		_, _ = fmt.Fprintln(inputFile, absPath)
+		if _, serr := inputFile.Seek(0, 0); serr != nil {
+			t.Fatalf("seek: %v", serr)
+		}
+
+		oldArgs := os.Args
+		args := []string{"next", "enqueue", "--db", dbPath, "--treatment", "lint"}
+		if specHash != "" {
+			args = append(args, "--spec-hash", specHash)
+		}
+		os.Args = args
+		defer func() { os.Args = oldArgs }()
+
+		oldStdin := os.Stdin
+		os.Stdin = inputFile
+		defer func() { os.Stdin = oldStdin }()
+
+		captureStdout(t, func() { enqueueCmd() })
+	}
+
+	// First enqueue under spec "v1", mark done.
+	runEnqueue("v1")
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB verify: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := markDone(db, ph, "lint", "result", ""); err != nil {
+		t.Fatalf("markDone: %v", err)
+	}
+
+	var doneAt sql.NullString
+	if err := db.QueryRow("SELECT done_at FROM queue WHERE path_hash = ?", ph).Scan(&doneAt); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !doneAt.Valid {
+		t.Fatal("expected done_at set after markDone")
+	}
+
+	// Content is unchanged, but the op spec changed ("v1" -> "v2") — the
+	// unit must reopen even though its name and bytes are identical.
+	runEnqueue("v2")
+
+	if err := db.QueryRow("SELECT done_at FROM queue WHERE path_hash = ?", ph).Scan(&doneAt); err != nil {
+		t.Fatalf("scan after spec-hash change: %v", err)
+	}
+	if doneAt.Valid {
+		t.Fatal("expected done_at to be NULL after spec-hash change even though content is unchanged")
+	}
+
+	// A reopened unit must also shed any active lease — otherwise a claimed
+	// row stays locked until lease expiry even though it needs a re-run.
+	if _, err := db.Exec("UPDATE queue SET claimed_at = DATETIME('now'), claimed_by = 'w1' WHERE path_hash = ?", ph); err != nil {
+		t.Fatalf("set claim: %v", err)
+	}
+	runEnqueue("v3")
+
+	var claimedAt, claimedBy sql.NullString
+	if err := db.QueryRow("SELECT claimed_at, claimed_by FROM queue WHERE path_hash = ?", ph).Scan(&claimedAt, &claimedBy); err != nil {
+		t.Fatalf("scan claim after spec-hash change: %v", err)
+	}
+	if claimedAt.Valid || claimedBy.Valid {
+		t.Fatal("expected claimed_at/claimed_by to be NULL after spec-hash change reopened the unit")
+	}
+}
+
+func TestEnqueueCmd_StaysDone_When_ContentAndSpecHashUnchanged(t *testing.T) {
+	tmpDir := setupWorkDir(t)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+
+	validFile := filepath.Join(tmpDir, "unit.go")
+	if err := os.WriteFile(validFile, []byte("package unit"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	absPath, err := filepath.Abs(validFile)
+	if err != nil {
+		t.Fatalf("abs: %v", err)
+	}
+	ph := pathHash(absPath)
+
+	runEnqueue := func() {
+		inputFile, cerr := os.CreateTemp(tmpDir, "input")
+		if cerr != nil {
+			t.Fatalf("create temp input: %v", cerr)
+		}
+		defer func() { _ = inputFile.Close() }()
+		_, _ = fmt.Fprintln(inputFile, absPath)
+		if _, serr := inputFile.Seek(0, 0); serr != nil {
+			t.Fatalf("seek: %v", serr)
+		}
+
+		oldArgs := os.Args
+		os.Args = []string{"next", "enqueue", "--db", dbPath, "--treatment", "lint", "--spec-hash", "same"}
+		defer func() { os.Args = oldArgs }()
+
+		oldStdin := os.Stdin
+		os.Stdin = inputFile
+		defer func() { os.Stdin = oldStdin }()
+
+		captureStdout(t, func() { enqueueCmd() })
+	}
+
+	runEnqueue()
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB verify: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := markDone(db, ph, "lint", "result", ""); err != nil {
+		t.Fatalf("markDone: %v", err)
+	}
+
+	// Re-enqueue with identical content and identical spec-hash.
+	runEnqueue()
+
+	var doneAt sql.NullString
+	if err := db.QueryRow("SELECT done_at FROM queue WHERE path_hash = ?", ph).Scan(&doneAt); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !doneAt.Valid {
+		t.Fatal("expected done_at to remain set when content and spec-hash are both unchanged")
+	}
+}
+
+// ----------------------------------------
+// reconcile
+// ----------------------------------------
+
+func TestReconcileFromStdin_PrunesVanishedUnits_When_AbsentFromGroundTruth(t *testing.T) {
+	tmpDir := setupWorkDir(t)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	survivorPath := filepath.Join(tmpDir, "survivor.go")
+	vanishedPath := filepath.Join(tmpDir, "vanished.go")
+	survivorHash := pathHash(survivorPath)
+	vanishedHash := pathHash(vanishedPath)
+
+	if _, err := db.Exec(testInsertSQL, survivorPath, survivorHash, "ch1", "lint"); err != nil {
+		t.Fatalf("insert survivor: %v", err)
+	}
+	if _, err := db.Exec(testInsertSQL, vanishedPath, vanishedHash, "ch2", "lint"); err != nil {
+		t.Fatalf("insert vanished: %v", err)
+	}
+
+	pruned, kept, err := reconcileFromStdin(db, strings.NewReader(survivorPath+"\n"), "lint")
+	if err != nil {
+		t.Fatalf("reconcileFromStdin: %v", err)
+	}
+	if kept != 1 {
+		t.Fatalf("kept = %d, want 1", kept)
+	}
+	if len(pruned) != 1 || pruned[0].Path != vanishedPath {
+		t.Fatalf("pruned = %+v, want [%s]", pruned, vanishedPath)
+	}
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM queue WHERE treatment='lint'").Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("remaining rows = %d, want 1", count)
+	}
+
+	var remainingPath string
+	if err := db.QueryRow("SELECT path FROM queue WHERE treatment='lint'").Scan(&remainingPath); err != nil {
+		t.Fatalf("scan remaining: %v", err)
+	}
+	if remainingPath != survivorPath {
+		t.Fatalf("remaining path = %s, want %s", remainingPath, survivorPath)
+	}
+}
+
+func TestReconcileCmd_ReportsPrunedAndKept_When_RunViaCmd(t *testing.T) {
+	tmpDir := setupWorkDir(t)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	survivorPath := filepath.Join(tmpDir, "keep.go")
+	vanishedPath := filepath.Join(tmpDir, "gone.go")
+	if _, err := db.Exec(testInsertSQL, survivorPath, pathHash(survivorPath), "ch1", "sweep"); err != nil {
+		t.Fatalf("insert survivor: %v", err)
+	}
+	if _, err := db.Exec(testInsertSQL, vanishedPath, pathHash(vanishedPath), "ch2", "sweep"); err != nil {
+		t.Fatalf("insert vanished: %v", err)
+	}
+	_ = db.Close()
+
+	inputFile, err := os.CreateTemp(tmpDir, "units")
+	if err != nil {
+		t.Fatalf("create temp input: %v", err)
+	}
+	defer func() { _ = inputFile.Close() }()
+	_, _ = fmt.Fprintln(inputFile, survivorPath)
+	if _, err := inputFile.Seek(0, 0); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "reconcile", "--db", dbPath, "--treatment", "sweep", "--units", "-"}
+	defer func() { os.Args = oldArgs }()
+
+	oldStdin := os.Stdin
+	os.Stdin = inputFile
+	defer func() { os.Stdin = oldStdin }()
+
+	output := captureStdout(t, func() { reconcileCmd() })
+
+	if !strings.Contains(output, "reconciled: 1 pruned, 1 kept for treatment=sweep") {
+		t.Fatalf("unexpected output: %q", output)
+	}
+}
+
+// ----------------------------------------
+// gc
+// ----------------------------------------
+
+func TestStaleTreatments_ReturnsOnlyStale_When_MixedActivity(t *testing.T) {
+	tmpDir := setupWorkDir(t)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	freshPath := filepath.Join(tmpDir, "fresh.go")
+	stalePath := filepath.Join(tmpDir, "stale.go")
+
+	if _, err := db.Exec(
+		"INSERT INTO queue (path, path_hash, content_hash, treatment, updated_at) VALUES (?, ?, ?, ?, DATETIME('now'))",
+		freshPath, pathHash(freshPath), "ch1", "fresh-treatment",
+	); err != nil {
+		t.Fatalf("insert fresh: %v", err)
+	}
+	if _, err := db.Exec(
+		"INSERT INTO queue (path, path_hash, content_hash, treatment, updated_at) VALUES (?, ?, ?, ?, DATETIME('now', '-60 days'))",
+		stalePath, pathHash(stalePath), "ch2", "stale-treatment",
+	); err != nil {
+		t.Fatalf("insert stale: %v", err)
+	}
+
+	stale, err := staleTreatments(db, "30 days")
+	if err != nil {
+		t.Fatalf("staleTreatments: %v", err)
+	}
+	if len(stale) != 1 || stale[0] != "stale-treatment" {
+		t.Fatalf("stale = %v, want [stale-treatment]", stale)
+	}
+}
+
+func TestGCCmd_DropsStaleTreatment_When_ConfirmedViaYesFlag(t *testing.T) {
+	tmpDir := setupWorkDir(t)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+
+	stalePath := filepath.Join(tmpDir, "stale.go")
+	freshPath := filepath.Join(tmpDir, "fresh.go")
+	if _, err := db.Exec(
+		"INSERT INTO queue (path, path_hash, content_hash, treatment, updated_at) VALUES (?, ?, ?, ?, DATETIME('now', '-60 days'))",
+		stalePath, pathHash(stalePath), "ch1", "old",
+	); err != nil {
+		t.Fatalf("insert stale: %v", err)
+	}
+	if _, err := db.Exec(
+		"INSERT INTO queue (path, path_hash, content_hash, treatment, updated_at) VALUES (?, ?, ?, ?, DATETIME('now'))",
+		freshPath, pathHash(freshPath), "ch2", "current",
+	); err != nil {
+		t.Fatalf("insert fresh: %v", err)
+	}
+	_ = db.Close()
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "gc", "--db", dbPath, "--stale", "30 days", "--yes"}
+	defer func() { os.Args = oldArgs }()
+
+	output := captureStdout(t, func() { gcCmd() })
+	if !strings.Contains(output, "gc: dropped treatment=old (1 entries)") {
+		t.Fatalf("unexpected output: %q", output)
+	}
+
+	db2, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	var oldCount, currentCount int
+	if err := db2.QueryRow("SELECT COUNT(*) FROM queue WHERE treatment='old'").Scan(&oldCount); err != nil {
+		t.Fatalf("count old: %v", err)
+	}
+	if err := db2.QueryRow("SELECT COUNT(*) FROM queue WHERE treatment='current'").Scan(&currentCount); err != nil {
+		t.Fatalf("count current: %v", err)
+	}
+	if oldCount != 0 {
+		t.Fatalf("old treatment count = %d, want 0", oldCount)
+	}
+	if currentCount != 1 {
+		t.Fatalf("current treatment count = %d, want 1", currentCount)
+	}
+}
+
+func TestGCCmd_ReportsNoStale_When_AllTreatmentsFresh(t *testing.T) {
+	tmpDir := setupWorkDir(t)
+	dbPath := filepath.Join(tmpDir, "ledger.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	freshPath := filepath.Join(tmpDir, "fresh.go")
+	if _, err := db.Exec(
+		"INSERT INTO queue (path, path_hash, content_hash, treatment, updated_at) VALUES (?, ?, ?, ?, DATETIME('now'))",
+		freshPath, pathHash(freshPath), "ch1", "current",
+	); err != nil {
+		t.Fatalf("insert fresh: %v", err)
+	}
+	_ = db.Close()
+
+	oldArgs := os.Args
+	os.Args = []string{"next", "gc", "--db", dbPath, "--stale", "30 days", "--yes"}
+	defer func() { os.Args = oldArgs }()
+
+	output := captureStdout(t, func() { gcCmd() })
+	if !strings.Contains(output, "gc: no stale treatments") {
+		t.Fatalf("unexpected output: %q", output)
 	}
 }
