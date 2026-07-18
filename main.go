@@ -295,7 +295,13 @@ const upsertSQL = `
 	                      queue.result, NULL),
 	  next_at      = IIF(queue.content_hash = excluded.content_hash
 	                      AND COALESCE(queue.spec_hash,'') = COALESCE(excluded.spec_hash,''),
-	                      queue.next_at, NULL)
+	                      queue.next_at, NULL),
+	  claimed_at   = IIF(queue.content_hash = excluded.content_hash
+	                      AND COALESCE(queue.spec_hash,'') = COALESCE(excluded.spec_hash,''),
+	                      queue.claimed_at, NULL),
+	  claimed_by   = IIF(queue.content_hash = excluded.content_hash
+	                      AND COALESCE(queue.spec_hash,'') = COALESCE(excluded.spec_hash,''),
+	                      queue.claimed_by, NULL)
 `
 
 func enqueueCmd() {
@@ -846,7 +852,7 @@ Flags:
 	}
 	defer func() { _ = db.Close() }()
 
-	pruned, kept, err := reconcileFromStdin(db, *treatment)
+	pruned, kept, err := reconcileFromStdin(db, os.Stdin, *treatment)
 	if err != nil {
 		fatal("reconcile: %v", err)
 	}
@@ -883,12 +889,13 @@ func groundTruthHashes(r io.Reader) (map[string]bool, error) {
 }
 
 // reconcileFromStdin reads a newline-delimited ground-truth path list from
-// stdin and deletes any queue row for treatment whose path_hash is absent
-// from that list. Returns the pruned entries and the count kept.
-func reconcileFromStdin(db *sql.DB, treatment string) ([]PruneResult, int, error) {
+// r (os.Stdin in production) and deletes any queue row for treatment whose
+// path_hash is absent from that list. Returns the pruned entries and the
+// count kept.
+func reconcileFromStdin(db *sql.DB, r io.Reader, treatment string) ([]PruneResult, int, error) {
 	ctx := context.Background()
 
-	groundTruth, err := groundTruthHashes(os.Stdin)
+	groundTruth, err := groundTruthHashes(r)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -991,8 +998,8 @@ Flags:
 	if *stale == "" {
 		fatal("error: --stale required, e.g. --stale='30 days'")
 	}
-	if !validTimeModifier(*stale) {
-		fatal("error: --stale must be like '30 days', '12 hours'")
+	if !validLease(*stale) {
+		fatal("error: --stale must be a positive duration like '30 days', '12 hours'")
 	}
 
 	db, err := openDB(*dbPath)

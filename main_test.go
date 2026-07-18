@@ -1312,6 +1312,21 @@ func TestEnqueueCmd_ReactivatesEntry_When_SpecHashChanges(t *testing.T) {
 	if doneAt.Valid {
 		t.Fatal("expected done_at to be NULL after spec-hash change even though content is unchanged")
 	}
+
+	// A reopened unit must also shed any active lease — otherwise a claimed
+	// row stays locked until lease expiry even though it needs a re-run.
+	if _, err := db.Exec("UPDATE queue SET claimed_at = DATETIME('now'), claimed_by = 'w1' WHERE path_hash = ?", ph); err != nil {
+		t.Fatalf("set claim: %v", err)
+	}
+	runEnqueue("v3")
+
+	var claimedAt, claimedBy sql.NullString
+	if err := db.QueryRow("SELECT claimed_at, claimed_by FROM queue WHERE path_hash = ?", ph).Scan(&claimedAt, &claimedBy); err != nil {
+		t.Fatalf("scan claim after spec-hash change: %v", err)
+	}
+	if claimedAt.Valid || claimedBy.Valid {
+		t.Fatal("expected claimed_at/claimed_by to be NULL after spec-hash change reopened the unit")
+	}
 }
 
 func TestEnqueueCmd_StaysDone_When_ContentAndSpecHashUnchanged(t *testing.T) {
@@ -1399,20 +1414,7 @@ func TestReconcileFromStdin_PrunesVanishedUnits_When_AbsentFromGroundTruth(t *te
 		t.Fatalf("insert vanished: %v", err)
 	}
 
-	oldStdin := os.Stdin
-	r, w, perr := os.Pipe()
-	if perr != nil {
-		t.Fatalf("pipe: %v", perr)
-	}
-	os.Stdin = r
-	defer func() { os.Stdin = oldStdin }()
-
-	go func() {
-		_, _ = fmt.Fprintln(w, survivorPath)
-		_ = w.Close()
-	}()
-
-	pruned, kept, err := reconcileFromStdin(db, "lint")
+	pruned, kept, err := reconcileFromStdin(db, strings.NewReader(survivorPath+"\n"), "lint")
 	if err != nil {
 		t.Fatalf("reconcileFromStdin: %v", err)
 	}
