@@ -5,7 +5,12 @@ run:
   tests: true
 
 linters:
+  # Fleet floor (conform lint-floor rule): ride on golangci's standard set.
+  default: standard
   enable:
+    # Fleet floor
+    - staticcheck
+
     # Error handling
     - err113
     - errchkjson
@@ -160,6 +165,10 @@ linters:
         path: _test\.go
       - linters:
           - unparam
+        path: _test\.go
+      # CLI-arg string literals in tests read better inline than as constants
+      - linters:
+          - goconst
         path: _test\.go
       # main.go: relax complexity for CLI dispatch, allow exitAfterDefer
       - linters:

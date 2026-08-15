@@ -1,0 +1,42 @@
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: golangci-lint (pinned in .sandbox/project.conf)
+        run: |
+          . ./.sandbox/project.conf
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" "$GOLANGCI_LINT_VERSION"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # CI = the same gate a developer runs; no verb re-implemented in YAML
+      # (conform ci-gate rule). check runs vet + lint + test + build + conform.
+      - name: check
+        run: make check
+
+      # The race detector catches the concurrency-lifecycle defect class;
+      # -count=1 bypasses the test cache so race runs on every push.
+      - name: race
+        run: make test-race
