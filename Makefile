@@ -1,15 +1,38 @@
-.PHONY: test test-race lint vet qa fast changed doctor install clean all dupl vuln snipe-index cross amd64-sandbox arm64-sandbox
+.PHONY: help check audit deploy build selfcheck test test-race lint vet qa fast changed doctor install clean all dupl vuln snipe-index cross amd64-sandbox arm64-sandbox
 
 # Strict shell for recipes: fail on first error, undefined var, or pipe failure.
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 
+help: ## Show this help
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} \
+		/^[a-zA-Z0-9_-]+:.*?## / { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
+check: vet lint test build selfcheck ## Full repo: vet + lint + test + build + conform
+	@echo "=== check pass ==="
+
+audit: check test-race ## Exhaustive: check + race + dupl + vuln
+	@if command -v jscpd >/dev/null 2>&1; then jscpd .; else echo "skip: jscpd not installed"; fi
+	@if command -v govulncheck >/dev/null 2>&1; then govulncheck ./...; else echo "skip: govulncheck not installed"; fi
+	@echo "=== audit pass ==="
+
+deploy: install ## Build and install the next binary
+	@echo "=== deployed ==="
+
+build: ## Compile everything
+	go build ./...
+
+# Dogfood the fleet gate (sd-th5.23): conform is pinned as a go.mod tool
+# dependency (go.sum-verified); bumping the pin is a deliberate PR.
+selfcheck: ## Run conform (fleet SDLC checker) against this repo
+	go tool conform
+
 # Everything: QA + install
-all: qa install
+all: qa install ## QA + install
 	@echo "=== all pass ==="
 
 # Full QA: vet + lint + race tests + dupl + vuln
-qa: snipe-index
+qa: snipe-index ## Full QA: vet + lint + race tests + dupl + vuln
 	go vet ./...
 	golangci-lint run ./...
 	go test -race -timeout=5m -count=1 -cover ./...
@@ -18,29 +41,29 @@ qa: snipe-index
 	@echo "=== qa pass ==="
 
 # Quick iteration: vet + test (no lint, no race)
-fast: vet test
+fast: vet test ## Quick iteration: vet + test (no lint, no race)
 	@echo "=== fast pass ==="
 
-vet:
+vet: ## go vet
 	go vet ./...
 
-lint:
+lint: ## golangci-lint (version pinned in .sandbox/project.conf)
 	golangci-lint run ./...
 
-test:
+test: ## Unit tests with coverage
 	go test -count=1 -cover ./...
 
-test-race:
+test-race: ## Unit tests under the race detector
 	go test -race -timeout=5m -count=1 -cover ./...
 
-dupl:
+dupl: ## Duplicate-code scan (jscpd)
 	jscpd .
 
-vuln:
+vuln: ## Vulnerability scan (govulncheck)
 	govulncheck ./...
 
 # Validate only modified packages
-changed:
+changed: ## Validate only modified packages
 	@PKGS=$$( { git diff --name-only HEAD -- '*.go'; git ls-files --others --exclude-standard -- '*.go'; } \
 		| xargs dirname 2>/dev/null | sort -u | sed 's|^|./|' | grep -v '^\./$$'); \
 	if [ -z "$$PKGS" ]; then \
@@ -53,15 +76,16 @@ changed:
 		echo "=== changed pass ==="; \
 	fi
 
-install:
+install: ## go install the next binary
 	go install .
 
-clean:
+clean: ## Remove built binary and runtime data
 	rm -f next
 	rm -rf .quality/
 
 # ── Sandbox prebuilt versions ──
-GOLANGCI_LINT_VER ?= v2.11.3
+# golangci-lint version has ONE home: .sandbox/project.conf (conform lint-pin).
+GOLANGCI_LINT_VER := $(shell awk -F= '/^GOLANGCI_LINT_VERSION=/{print $$2}' .sandbox/project.conf)
 GOVULNCHECK_VER   ?= v1.1.4
 GOFUMPT_VER       ?= v0.9.2
 GOIMPORTS_VER     ?= v0.39.0
@@ -73,19 +97,19 @@ GOMOD_VER         := $(shell awk '/^go /{print $$2}' go.mod)
 # ── Sandbox prebuilt cross-compilation ──
 # Mutually exclusive: building one arch deletes the other.
 # Default (cross) builds amd64 — the Codex sandbox architecture.
-cross: amd64-sandbox
+cross: amd64-sandbox ## Cross-compile sandbox prebuilts (default: linux/amd64)
 
-amd64-sandbox:
+amd64-sandbox: ## Build linux/amd64 sandbox prebuilts
 	@echo "=== sandbox: linux/amd64 ==="
 	@rm -rf .bin/linux-arm64
 	@$(MAKE) --no-print-directory _sandbox-build SANDBOX_ARCH=amd64
 
-arm64-sandbox:
+arm64-sandbox: ## Build linux/arm64 sandbox prebuilts
 	@echo "=== sandbox: linux/arm64 ==="
 	@rm -rf .bin/linux-amd64
 	@$(MAKE) --no-print-directory _sandbox-build SANDBOX_ARCH=arm64
 
-_sandbox-build:
+_sandbox-build: ## Internal: cross-compile toolchain for the Codex sandbox
 	@# Pre-flight: local Go must be >= go.mod target
 	@LOCAL_GO=$$(go version | sed 's/.*go\([0-9]*\.[0-9]*\).*/\1/'); \
 	MOD_MIN=$$(echo $(GOMOD_VER) | cut -d. -f1)$$(printf '%03d' $$(echo $(GOMOD_VER) | cut -d. -f2)); \
@@ -158,7 +182,7 @@ _sandbox-build:
 	@du -h .bin/linux-$(SANDBOX_ARCH)/* | sort -rh
 
 # Freshen snipe index if stale
-snipe-index:
+snipe-index: ## Freshen snipe index if stale
 	@if command -v snipe >/dev/null 2>&1; then \
 		state=$$(snipe status 2>/dev/null | jq -r '.results[0].state // "unknown"'); \
 		if [ "$$state" != "fresh" ]; then \
@@ -170,7 +194,7 @@ snipe-index:
 	fi
 
 # Validate toolchain
-doctor:
+doctor: ## Validate toolchain
 	@echo "=== doctor ==="
 	@MISSING=0; \
 	for tool in go golangci-lint snipe jq; do \
