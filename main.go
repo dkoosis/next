@@ -27,6 +27,12 @@ var embeddedSchema string
 
 const defaultDBPath = ".quality/ledger.db"
 
+// Command verbs (also the FlagSet names).
+const (
+	cmdEnqueue = "enqueue"
+	cmdClaim   = "claim"
+)
+
 // ErrNoQueueEntry is returned by markDone when no row matches the given path/treatment.
 var ErrNoQueueEntry = errors.New("no matching queue entry")
 
@@ -36,9 +42,9 @@ func main() {
 		os.Exit(1)
 	}
 	switch os.Args[1] {
-	case "enqueue":
+	case cmdEnqueue:
 		enqueueCmd()
-	case "claim":
+	case cmdClaim:
 		claimCmd()
 	case "done":
 		doneCmd()
@@ -309,7 +315,7 @@ const upsertSQL = `
 `
 
 func enqueueCmd() {
-	fs := flag.NewFlagSet("enqueue", flag.ExitOnError)
+	fs := flag.NewFlagSet(cmdEnqueue, flag.ExitOnError)
 	treatment := fs.String("treatment", "default", "treatment name")
 	dbPath := fs.String("db", defaultDBPath, "database path")
 	specHash := fs.String("spec-hash", "", "op-spec hash; changing it reopens done units even if content is unchanged")
@@ -436,7 +442,7 @@ func normalizeLease(s string) string {
 }
 
 func claimCmd() {
-	fs := flag.NewFlagSet("claim", flag.ExitOnError)
+	fs := flag.NewFlagSet(cmdClaim, flag.ExitOnError)
 	treatment := fs.String("treatment", "default", "treatment name")
 	cursor := fs.String("cursor", "", "resume after this path_hash")
 	n := fs.Int("n", 1, "number to claim")
