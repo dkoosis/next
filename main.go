@@ -201,6 +201,10 @@ func dirHash(path string) (string, error) {
 // ----------------------------------------
 
 func openDB(path string) (*sql.DB, error) {
+	// Must precede the first connection: the embedded SQLite is a Wasm module,
+	// and this installs the on-disk cache for its compiled form (wasmcache.go).
+	initWasmCache()
+
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
 	}
