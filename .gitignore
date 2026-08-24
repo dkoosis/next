@@ -29,3 +29,6 @@ go.work.sum
 # Codex sandbox
 .codex/cache/
 .codex/setup-report.json
+
+# bd audit residue: passive re-export, Dolt is source of truth
+.beads/interactions.jsonl
