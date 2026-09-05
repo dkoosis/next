@@ -1,0 +1,9 @@
+{
+  "profile": "tool",
+  "exceptions": [
+    {
+      "rule": "roadmap",
+      "reason": "no direction document exists for this repo \u2014 no NORTH_STAR.md here and none at ~/Projects/kg/Project/next/. Writing a \u2605 line is dk's call (decision 9b4cbc91016f), so the sweep waived the rule rather than invent one. Retires with sd-mzgy.9."
+    }
+  ]
+}
